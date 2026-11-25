@@ -1,0 +1,12 @@
+[package]
+name = "triangle"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+pollster = "0.4"
+wgpu = "=30.0.2"
+winit = "0.30"

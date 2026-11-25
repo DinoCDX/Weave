@@ -1,0 +1,8 @@
+[workspace]
+resolver = "3"
+members = ["crates/weave-heart", "crates/weave-macros", "examples/triangle"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.89"
+license = "MIT OR Apache-2.0"
