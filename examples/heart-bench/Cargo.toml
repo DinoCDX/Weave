@@ -1,0 +1,10 @@
+[package]
+name = "heart-bench"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+weave-heart = { path = "../../crates/weave-heart" }

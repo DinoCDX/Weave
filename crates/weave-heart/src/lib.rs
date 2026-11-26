@@ -21,7 +21,7 @@ pub use component::{
 pub use error::{ReparentError, SpawnError};
 pub use object::{Name, ObjectHandle, ObjectId, Transform};
 pub use platform::{PlatformKey, PlatformOverride};
-pub use runtime::{FrameReport, Runtime, RuntimeStats, SkipReason, Skipped};
+pub use runtime::{FrameReport, LogEvent, Runtime, RuntimeStats, SkipReason, Skipped};
 pub use script::{AttachError, RegistryError, Script, ScriptContext, ScriptFailure};
 pub use stage::{Listener, NoListener, Stage, StageContext};
 pub use world::ObjectWorld;

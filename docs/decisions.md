@@ -127,3 +127,17 @@ The project was built and tested with Rust 1.89.0 (`cargo build`, `cargo test`, 
 | D-62 | Optional fields | `Option<T>` implements `Field`. A missing optional field loads as `None`, so files written before a field was added still load. A missing required field is still an error. | Confirmed by tests |
 | D-63 | Numeric types | `i32` and `u32` are stored as integers with range checks. `f64` has its own kind, so it keeps full precision. | Confirmed by tests |
 | D-64 | Syntax | `syn` is built with `clone-impls` in addition to `derive`, `parsing`, `printing`, and `proc-macro`. The lock file pins the version. | Confirmed by build |
+
+## Heart review fixes
+
+| ID | Decision | Choice | Status |
+|---|---|---|---|
+| D-65 | Shared names | Each name is stored once as an `Arc<str>`, shared by the `Name` component and the sibling index. Reading a name clones a pointer and does not allocate. `path()` still builds a new string. | Confirmed by test (`Arc::ptr_eq`) |
+| D-66 | Runtime state split | `Runtime` holds three parts: `Core` (world, commands, input, time), `Lifecycle` (loaded objects and pending work), and `Scripts` (attachments, registry, platform state). Each stage builds one environment from `Core`. Replaces eight copies of the same destructuring. | Confirmed by the existing suite (90 tests) |
+| D-67 | Handle hashing | Maps keyed by `ObjectHandle` (attachments, child scopes, override set) use a small multiplicative hasher instead of the default SipHash. | Measured: see D-69 |
+| D-68 | Logging | Skips, script failures, and rejected commands go through one sink set with `Runtime::set_log_sink`. The default writes to stderr in debug builds only. Nothing is printed from inside the runtime any more. | Confirmed by tests |
+| D-69 | Benchmark | `examples/heart-bench` reports the best of seven runs per case, because single runs on this shared single-CPU machine varied by up to 60%. Current numbers, release build, 10,000 objects: plain 9 ns per object per frame, half scripted 19 ns, all scripted 38 ns. The earlier single-run baseline is too noisy to compare precisely, so no speedup is claimed. | Measured on this machine only |
+| D-70 | Script helpers | `ScriptContext` acts on its own object directly: `set_transform`, `set_enabled`, `despawn`, `reparent`, `insert_component`, `edit_component`. These queue commands, so they take effect at the next frame boundary, as before. | Confirmed by tests |
+| D-71 | Parent accessors | `parent_of(h)` returns the parent handle, `is_root(h)` returns `Option<bool>`, and both return `None` for stale handles. `parent(h)` is kept and documents the nested form. | Confirmed by tests |
+| D-72 | Randomised tree test | `tests/model.rs` runs 40 seeded sequences of 300 random spawn, despawn, and re-parent operations against a reference model. After every step it checks the object count, id order, names, parents, paths, lookup by path, children, roots, and that stale handles stay dead. It also fails if a hard case never occurs (cycles, name clashes, stale targets). | Confirmed; 0 mismatches |
+| D-73 | Services boilerplate | `type Services = ();` cannot be removed on stable Rust. Associated type defaults are unstable, and removing the declaration would also remove the compile-time check that undeclared services fail. Kept as is. | Known limit |

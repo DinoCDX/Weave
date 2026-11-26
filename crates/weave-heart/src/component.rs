@@ -296,3 +296,18 @@ impl Field for Vec<String> {
         }
     }
 }
+
+impl Field for std::sync::Arc<str> {
+    const KIND: FieldKind = FieldKind::Text;
+
+    fn to_value(&self) -> Value {
+        Value::Text(self.to_string())
+    }
+
+    fn from_value(value: &Value) -> Option<Self> {
+        match value {
+            Value::Text(v) => Some(std::sync::Arc::from(v.as_str())),
+            _ => None,
+        }
+    }
+}

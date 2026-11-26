@@ -1,11 +1,12 @@
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fmt;
 use std::fmt::Write as _;
 
 use crate::command::{Command, CommandBuffer};
 use crate::component::Component;
 use crate::error::{ReparentError, SpawnError};
-use crate::object::{ObjectHandle, ObjectId};
+use crate::object::{HandleBuild, ObjectHandle, ObjectId};
 use crate::platform::{PlatformKey, PlatformOverride};
 use crate::script::{
     AttachError, Attachments, ErasedScript, Factory, RegistryError, Script, ScriptFailure, invoke,
@@ -29,7 +30,7 @@ pub struct Skipped {
     pub reason: SkipReason,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RuntimeStats {
     pub objects: usize,
     pub loaded: usize,
@@ -48,34 +49,6 @@ pub struct FrameReport {
     pub attach_errors: Vec<AttachError>,
 }
 
-struct Entry {
-    handle: ObjectHandle,
-    enabled: bool,
-    ready: bool,
-}
-
-struct Unload {
-    handle: ObjectHandle,
-    despawn: bool,
-}
-
-pub struct Runtime {
-    world: ObjectWorld,
-    commands: CommandBuffer,
-    loaded: BTreeMap<ObjectId, Entry>,
-    active: BTreeMap<ObjectId, ObjectHandle>,
-    pending_ready: BTreeSet<ObjectId>,
-    pending_load: Vec<ObjectHandle>,
-    pending_unload: Vec<Unload>,
-    pending_enable: BTreeMap<ObjectId, (ObjectHandle, bool)>,
-    attachments: Attachments,
-    registry: HashMap<String, Factory>,
-    platform: Option<PlatformKey>,
-    overrides_applied: HashSet<ObjectHandle>,
-    input: InputFrame,
-    time: TimeView,
-}
-
 impl FrameReport {
     pub fn issue_count(&self) -> usize {
         self.skipped.len()
@@ -91,6 +64,71 @@ impl FrameReport {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LogEvent {
+    Skipped(Skipped),
+    ScriptFailed(ScriptFailure),
+    Rejected(String),
+}
+
+impl fmt::Display for LogEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Skipped(skipped) => write!(
+                f,
+                "skipped {} on {:?}: {:?}",
+                skipped.command, skipped.handle, skipped.reason
+            ),
+            Self::ScriptFailed(failure) => write!(f, "{failure}"),
+            Self::Rejected(text) => write!(f, "{text}"),
+        }
+    }
+}
+
+type LogSink = Box<dyn FnMut(&LogEvent) + Send>;
+
+struct Core {
+    world: ObjectWorld,
+    commands: CommandBuffer,
+    input: InputFrame,
+    time: TimeView,
+}
+
+struct Entry {
+    handle: ObjectHandle,
+    enabled: bool,
+    ready: bool,
+}
+
+struct Unload {
+    handle: ObjectHandle,
+    despawn: bool,
+}
+
+#[derive(Default)]
+struct Lifecycle {
+    loaded: BTreeMap<ObjectId, Entry>,
+    active: BTreeMap<ObjectId, ObjectHandle>,
+    pending_ready: BTreeSet<ObjectId>,
+    pending_load: Vec<ObjectHandle>,
+    pending_unload: Vec<Unload>,
+    pending_enable: BTreeMap<ObjectId, (ObjectHandle, bool)>,
+}
+
+struct Scripts {
+    attachments: Attachments,
+    registry: HashMap<String, Factory>,
+    platform: Option<PlatformKey>,
+    overrides_applied: HashSet<ObjectHandle, HandleBuild>,
+}
+
+pub struct Runtime {
+    core: Core,
+    life: Lifecycle,
+    scripts: Scripts,
+    log_sink: Option<LogSink>,
+}
+
 impl Default for Runtime {
     fn default() -> Self {
         Self::new()
@@ -104,29 +142,37 @@ impl Runtime {
 
     pub fn for_platform(platform: Option<PlatformKey>) -> Self {
         Self {
-            world: ObjectWorld::new(),
-            commands: CommandBuffer::default(),
-            loaded: BTreeMap::new(),
-            active: BTreeMap::new(),
-            pending_ready: BTreeSet::new(),
-            pending_load: Vec::new(),
-            pending_unload: Vec::new(),
-            pending_enable: BTreeMap::new(),
-            attachments: Attachments::default(),
-            registry: HashMap::new(),
-            platform,
-            overrides_applied: HashSet::new(),
-            input: InputFrame::default(),
-            time: TimeView::new(0.0, 0.0),
+            core: Core {
+                world: ObjectWorld::new(),
+                commands: CommandBuffer::default(),
+                input: InputFrame::default(),
+                time: TimeView::new(0.0, 0.0),
+            },
+            life: Lifecycle::default(),
+            scripts: Scripts {
+                attachments: Attachments::default(),
+                registry: HashMap::new(),
+                platform,
+                overrides_applied: HashSet::default(),
+            },
+            log_sink: None,
         }
     }
 
+    pub fn set_log_sink(&mut self, sink: impl FnMut(&LogEvent) + Send + 'static) {
+        self.log_sink = Some(Box::new(sink));
+    }
+
+    pub fn clear_log_sink(&mut self) {
+        self.log_sink = None;
+    }
+
     pub fn platform(&self) -> Option<PlatformKey> {
-        self.platform
+        self.scripts.platform
     }
 
     pub fn world(&self) -> &ObjectWorld {
-        &self.world
+        &self.core.world
     }
 
     pub fn spawn(
@@ -134,11 +180,11 @@ impl Runtime {
         parent: Option<ObjectHandle>,
         name: &str,
     ) -> Result<ObjectHandle, SpawnError> {
-        self.world.spawn(parent, name)
+        self.core.world.spawn(parent, name)
     }
 
     pub fn insert_component<C: Component>(&mut self, object: ObjectHandle, component: C) -> bool {
-        self.world.insert_component(object, component)
+        self.core.world.insert_component(object, component)
     }
 
     pub fn reparent(
@@ -146,23 +192,23 @@ impl Runtime {
         object: ObjectHandle,
         parent: Option<ObjectHandle>,
     ) -> Result<(), ReparentError> {
-        self.world.reparent(object, parent)
+        self.core.world.reparent(object, parent)
     }
 
     pub fn commands(&mut self) -> &mut CommandBuffer {
-        &mut self.commands
+        &mut self.core.commands
     }
 
     pub fn input(&self) -> &InputFrame {
-        &self.input
+        &self.core.input
     }
 
     pub fn input_mut(&mut self) -> &mut InputFrame {
-        &mut self.input
+        &mut self.core.input
     }
 
     pub fn elapsed(&self) -> f64 {
-        self.time.elapsed()
+        self.core.time.elapsed()
     }
 
     pub fn is_loaded(&self, object: ObjectHandle) -> bool {
@@ -178,7 +224,7 @@ impl Runtime {
     }
 
     pub fn loaded_count(&self) -> usize {
-        self.loaded.len()
+        self.life.loaded.len()
     }
 
     pub fn register_script<S, F>(
@@ -191,11 +237,11 @@ impl Runtime {
         F: Fn() -> S + 'static,
     {
         let name = name.into();
-        if self.registry.contains_key(&name) {
+        if self.scripts.registry.contains_key(&name) {
             return Err(RegistryError::Duplicate(name));
         }
         let boxed: Factory = Box::new(move || -> Box<dyn ErasedScript> { Box::new(factory()) });
-        self.registry.insert(name, boxed);
+        self.scripts.registry.insert(name, boxed);
         Ok(())
     }
 
@@ -212,7 +258,7 @@ impl Runtime {
         object: ObjectHandle,
         name: &str,
     ) -> Result<usize, AttachError> {
-        let script = match self.registry.get(name) {
+        let script = match self.scripts.registry.get(name) {
             Some(factory) => factory(),
             None => return Err(AttachError::UnknownScript(name.to_owned())),
         };
@@ -220,11 +266,16 @@ impl Runtime {
     }
 
     pub fn script_count(&self, object: ObjectHandle) -> usize {
-        self.attachments.by_object.get(&object).map_or(0, Vec::len)
+        self.scripts
+            .attachments
+            .by_object
+            .get(&object)
+            .map_or(0, Vec::len)
     }
 
     pub fn script<T: Script>(&self, object: ObjectHandle, index: usize) -> Option<&T> {
         let erased: &dyn ErasedScript = self
+            .scripts
             .attachments
             .by_object
             .get(&object)?
@@ -241,24 +292,57 @@ impl Runtime {
 
     pub fn stats(&self) -> RuntimeStats {
         RuntimeStats {
-            objects: self.world.len(),
-            loaded: self.loaded.len(),
-            active: self.active.len(),
-            scripts: self.attachments.by_object.values().map(Vec::len).sum(),
-            queued_commands: self.commands.len(),
+            objects: self.core.world.len(),
+            loaded: self.life.loaded.len(),
+            active: self.life.active.len(),
+            scripts: self
+                .scripts
+                .attachments
+                .by_object
+                .values()
+                .map(Vec::len)
+                .sum(),
+            queued_commands: self.core.commands.len(),
         }
     }
 
     pub fn describe(&self) -> String {
         let mut out = String::new();
-        for root in self.world.roots() {
+        for root in self.core.world.roots() {
             self.describe_into(root, 0, &mut out);
         }
         out
     }
 
+    pub fn tick(&mut self, dt: f32, listener: &mut dyn Listener) -> FrameReport {
+        let elapsed = self.core.time.elapsed() + f64::from(dt);
+        self.core.time = TimeView::new(dt, elapsed);
+        let mut report = FrameReport::default();
+        self.intake(&mut report);
+        self.late_start(&mut report);
+        self.load(listener, &mut report);
+        self.enable(listener, &mut report);
+        self.ready(listener, &mut report);
+        self.frame_stage(Stage::Update, listener, &mut report);
+        self.frame_stage(Stage::LateUpdate, listener, &mut report);
+        self.disable(listener, &mut report);
+        self.unload(listener, &mut report);
+        self.flush_log(&report);
+        report
+    }
+
+    fn entry(&self, object: ObjectHandle) -> Option<&Entry> {
+        let id = self.core.world.id(object)?;
+        self.life.loaded.get(&id)
+    }
+
     fn describe_into(&self, object: ObjectHandle, depth: usize, out: &mut String) {
-        let name = self.world.name(object).unwrap_or_default();
+        let name = self
+            .core
+            .world
+            .name(object)
+            .map(|name| name.to_string())
+            .unwrap_or_default();
         let state = match self.entry(object) {
             None => "unloaded",
             Some(entry) if !entry.enabled => "disabled",
@@ -272,30 +356,9 @@ impl Runtime {
             "",
             indent = depth * 2
         );
-        for child in self.world.children(object).into_iter().flatten() {
+        for child in self.core.world.children(object).into_iter().flatten() {
             self.describe_into(child, depth + 1, out);
         }
-    }
-
-    pub fn tick(&mut self, dt: f32, listener: &mut dyn Listener) -> FrameReport {
-        let elapsed = self.time.elapsed() + f64::from(dt);
-        self.time = TimeView::new(dt, elapsed);
-        let mut report = FrameReport::default();
-        self.intake(&mut report);
-        self.run_late_start(&mut report);
-        self.run_load(listener, &mut report);
-        self.run_enable(listener, &mut report);
-        self.run_ready(listener, &mut report);
-        self.run_frame_stage(Stage::Update, listener, &mut report);
-        self.run_frame_stage(Stage::LateUpdate, listener, &mut report);
-        self.run_disable(listener, &mut report);
-        self.run_unload(listener, &mut report);
-        report
-    }
-
-    fn entry(&self, object: ObjectHandle) -> Option<&Entry> {
-        let id = self.world.id(object)?;
-        self.loaded.get(&id)
     }
 
     fn attach_boxed(
@@ -304,58 +367,86 @@ impl Runtime {
         script: Box<dyn ErasedScript>,
     ) -> Result<usize, AttachError> {
         let id = self
+            .core
             .world
             .id(object)
             .ok_or(AttachError::StaleObject(object))?;
-        let index = push_script(&mut self.attachments, object, script);
-        if self.loaded.contains_key(&id) {
-            self.attachments.unstarted.insert(id, object);
+        let index = push_script(&mut self.scripts.attachments, object, script);
+        if self.life.loaded.contains_key(&id) {
+            self.scripts.attachments.unstarted.insert(id, object);
         }
         Ok(index)
     }
 
+    fn flush_log(&mut self, report: &FrameReport) {
+        if self.log_sink.is_none() && !cfg!(debug_assertions) {
+            return;
+        }
+        for skipped in &report.skipped {
+            self.log(LogEvent::Skipped(*skipped));
+        }
+        for failure in &report.script_failures {
+            self.log(LogEvent::ScriptFailed(failure.clone()));
+        }
+        for error in &report.spawn_errors {
+            self.log(LogEvent::Rejected(format!("spawn failed: {error}")));
+        }
+        for error in &report.reparent_errors {
+            self.log(LogEvent::Rejected(format!("reparent failed: {error}")));
+        }
+        for error in &report.attach_errors {
+            self.log(LogEvent::Rejected(format!("attach failed: {error}")));
+        }
+        for error in &report.override_errors {
+            self.log(LogEvent::Rejected(format!(
+                "platform override failed: {error}"
+            )));
+        }
+    }
+
+    fn log(&mut self, event: LogEvent) {
+        match self.log_sink.as_mut() {
+            Some(sink) => sink(&event),
+            None => eprintln!("{event}"),
+        }
+    }
+
     fn intake(&mut self, report: &mut FrameReport) {
-        let queued = std::mem::take(&mut self.commands.queue);
+        let queued = std::mem::take(&mut self.core.commands.queue);
         for command in queued {
             match command {
                 Command::Spawn { parent, name } => {
-                    if let Err(error) = self.world.spawn(parent, &name) {
+                    if let Err(error) = self.core.world.spawn(parent, &name) {
                         report.spawn_errors.push(error);
                     }
                 }
-                Command::Despawn(object) => self.pending_unload.push(Unload {
+                Command::Despawn(object) => self.life.pending_unload.push(Unload {
                     handle: object,
                     despawn: true,
                 }),
-                Command::Unload(object) => self.pending_unload.push(Unload {
+                Command::Unload(object) => self.life.pending_unload.push(Unload {
                     handle: object,
                     despawn: false,
                 }),
-                Command::Load(object) => self.pending_load.push(object),
+                Command::Load(object) => self.life.pending_load.push(object),
                 Command::Reparent { object, parent } => {
-                    if let Err(error) = self.world.reparent(object, parent) {
+                    if let Err(error) = self.core.world.reparent(object, parent) {
                         report.reparent_errors.push(error);
                     }
                 }
                 Command::Edit { object, name, edit } => {
-                    if !self.world.contains(object) {
-                        record_skip(
-                            &mut report.skipped,
-                            Skipped {
-                                command: name,
-                                handle: object,
-                                reason: SkipReason::StaleHandle,
-                            },
-                        );
-                    } else if !edit(&mut self.world, object) {
-                        record_skip(
-                            &mut report.skipped,
-                            Skipped {
-                                command: name,
-                                handle: object,
-                                reason: SkipReason::Rejected,
-                            },
-                        );
+                    if !self.core.world.contains(object) {
+                        report.skipped.push(Skipped {
+                            command: name,
+                            handle: object,
+                            reason: SkipReason::StaleHandle,
+                        });
+                    } else if !edit(&mut self.core.world, object) {
+                        report.skipped.push(Skipped {
+                            command: name,
+                            handle: object,
+                            reason: SkipReason::Rejected,
+                        });
                     }
                 }
                 Command::Attach { object, script } => {
@@ -363,7 +454,7 @@ impl Runtime {
                         report.attach_errors.push(error);
                     }
                 }
-                Command::AttachModular { object, name } => match self.registry.get(&name) {
+                Command::AttachModular { object, name } => match self.scripts.registry.get(&name) {
                     Some(factory) => {
                         let script = factory();
                         if let Err(error) = self.attach_boxed(object, script) {
@@ -372,29 +463,23 @@ impl Runtime {
                     }
                     None => report.attach_errors.push(AttachError::UnknownScript(name)),
                 },
-                Command::SetEnabled { object, enabled } => match self.world.id(object) {
+                Command::SetEnabled { object, enabled } => match self.core.world.id(object) {
                     Some(id) => {
-                        self.pending_enable.insert(id, (object, enabled));
+                        self.life.pending_enable.insert(id, (object, enabled));
                     }
-                    None => record_skip(
-                        &mut report.skipped,
-                        Skipped {
-                            command: "set_enabled",
-                            handle: object,
-                            reason: SkipReason::StaleHandle,
-                        },
-                    ),
+                    None => report.skipped.push(Skipped {
+                        command: "set_enabled",
+                        handle: object,
+                        reason: SkipReason::StaleHandle,
+                    }),
                 },
                 Command::SetTransform { object, transform } => {
-                    if !self.world.set_transform(object, transform) {
-                        record_skip(
-                            &mut report.skipped,
-                            Skipped {
-                                command: "set_transform",
-                                handle: object,
-                                reason: SkipReason::StaleHandle,
-                            },
-                        );
+                    if !self.core.world.set_transform(object, transform) {
+                        report.skipped.push(Skipped {
+                            command: "set_transform",
+                            handle: object,
+                            reason: SkipReason::StaleHandle,
+                        });
                     }
                 }
             }
@@ -403,43 +488,40 @@ impl Runtime {
 
     fn take_enable_requests(&mut self, enable: bool) -> Vec<ObjectHandle> {
         let ids: Vec<ObjectId> = self
+            .life
             .pending_enable
             .iter()
             .filter(|(_, (_, on))| *on == enable)
             .map(|(id, _)| *id)
             .collect();
         ids.into_iter()
-            .filter_map(|id| self.pending_enable.remove(&id).map(|(object, _)| object))
+            .filter_map(|id| {
+                self.life
+                    .pending_enable
+                    .remove(&id)
+                    .map(|(object, _)| object)
+            })
             .collect()
     }
 
-    fn run_late_start(&mut self, report: &mut FrameReport) {
-        let pending = std::mem::take(&mut self.attachments.unstarted);
+    fn late_start(&mut self, report: &mut FrameReport) {
+        let pending = std::mem::take(&mut self.scripts.attachments.unstarted);
         let Self {
-            world,
-            commands,
-            input,
-            time,
-            loaded,
-            attachments,
+            core,
+            life,
+            scripts,
             ..
         } = self;
-        let mut env = Env {
-            world: &*world,
-            commands: &mut *commands,
-            input: &*input,
-            time: *time,
-            failures: &mut report.script_failures,
-        };
+        let mut env = env(core, &mut report.script_failures);
         for (id, object) in pending {
-            if !world.contains(object) {
+            if !env.world.contains(object) {
                 continue;
             }
-            let Some(entry) = loaded.get(&id) else {
+            let Some(entry) = life.loaded.get(&id) else {
                 continue;
             };
             let (enabled, ready) = (entry.enabled, entry.ready);
-            let Some(list) = attachments.by_object.get_mut(&object) else {
+            let Some(list) = scripts.attachments.by_object.get_mut(&object) else {
                 continue;
             };
             for attachment in list.iter_mut().filter(|attachment| !attachment.started) {
@@ -454,49 +536,33 @@ impl Runtime {
         }
     }
 
-    fn run_load(&mut self, listener: &mut dyn Listener, report: &mut FrameReport) {
-        let mut requests = std::mem::take(&mut self.pending_load);
-        requests.sort_by_key(|object| self.world.id(*object));
+    fn load(&mut self, listener: &mut dyn Listener, report: &mut FrameReport) {
+        let mut requests = std::mem::take(&mut self.life.pending_load);
+        requests.sort_by_key(|object| self.core.world.id(*object));
         let Self {
-            world,
-            commands,
-            input,
-            time,
-            loaded,
-            pending_ready,
-            attachments,
-            registry,
-            platform,
-            overrides_applied,
+            core,
+            life,
+            scripts,
             ..
         } = self;
-        let mut env = Env {
-            world: &*world,
-            commands: &mut *commands,
-            input: &*input,
-            time: *time,
-            failures: &mut report.script_failures,
-        };
+        let mut env = env(core, &mut report.script_failures);
         for root in requests {
-            if !world.contains(root) {
-                record_skip(
-                    &mut report.skipped,
-                    Skipped {
-                        command: "load",
-                        handle: root,
-                        reason: SkipReason::StaleHandle,
-                    },
-                );
+            if !env.world.contains(root) {
+                report.skipped.push(Skipped {
+                    command: "load",
+                    handle: root,
+                    reason: SkipReason::StaleHandle,
+                });
                 continue;
             }
-            for object in subtree_preorder(world, root) {
-                let Some(id) = world.id(object) else {
+            for object in subtree_preorder(env.world, root) {
+                let Some(id) = env.world.id(object) else {
                     continue;
                 };
-                if loaded.contains_key(&id) {
+                if life.loaded.contains_key(&id) {
                     continue;
                 }
-                loaded.insert(
+                life.loaded.insert(
                     id,
                     Entry {
                         handle: object,
@@ -504,63 +570,50 @@ impl Runtime {
                         ready: false,
                     },
                 );
-                pending_ready.insert(id);
-                apply_platform_overrides(
+                life.pending_ready.insert(id);
+                apply_platform_overrides(object, env.world, scripts, &mut report.override_errors);
+                emit(
+                    listener,
+                    &mut scripts.attachments,
+                    Stage::Load,
                     object,
-                    world,
-                    *platform,
-                    registry,
-                    attachments,
-                    overrides_applied,
-                    &mut report.override_errors,
+                    &mut env,
                 );
-                emit(listener, attachments, Stage::Load, object, &mut env);
-                emit(listener, attachments, Stage::Enable, object, &mut env);
+                emit(
+                    listener,
+                    &mut scripts.attachments,
+                    Stage::Enable,
+                    object,
+                    &mut env,
+                );
             }
         }
     }
 
-    fn run_enable(&mut self, listener: &mut dyn Listener, report: &mut FrameReport) {
+    fn enable(&mut self, listener: &mut dyn Listener, report: &mut FrameReport) {
         let requests = self.take_enable_requests(true);
         let Self {
-            world,
-            commands,
-            input,
-            time,
-            loaded,
-            active,
-            pending_ready,
-            attachments,
+            core,
+            life,
+            scripts,
             ..
         } = self;
-        let mut env = Env {
-            world: &*world,
-            commands: &mut *commands,
-            input: &*input,
-            time: *time,
-            failures: &mut report.script_failures,
-        };
+        let mut env = env(core, &mut report.script_failures);
         for object in requests {
-            let Some(id) = world.id(object) else {
-                record_skip(
-                    &mut report.skipped,
-                    Skipped {
-                        command: "set_enabled",
-                        handle: object,
-                        reason: SkipReason::StaleHandle,
-                    },
-                );
+            let Some(id) = env.world.id(object) else {
+                report.skipped.push(Skipped {
+                    command: "set_enabled",
+                    handle: object,
+                    reason: SkipReason::StaleHandle,
+                });
                 continue;
             };
-            let Some(entry) = loaded.get_mut(&id) else {
-                record_skip(
-                    &mut report.skipped,
-                    Skipped {
-                        command: "set_enabled",
-                        handle: object,
-                        reason: SkipReason::NotLoaded,
-                    },
-                );
+            let Some(entry) = life.loaded.get_mut(&id) else {
+                report.skipped.push(Skipped {
+                    command: "set_enabled",
+                    handle: object,
+                    reason: SkipReason::NotLoaded,
+                });
                 continue;
             };
             if entry.enabled {
@@ -568,206 +621,187 @@ impl Runtime {
             }
             entry.enabled = true;
             if entry.ready {
-                active.insert(id, object);
+                life.active.insert(id, object);
             } else {
-                pending_ready.insert(id);
+                life.pending_ready.insert(id);
             }
-            emit(listener, attachments, Stage::Enable, object, &mut env);
+            emit(
+                listener,
+                &mut scripts.attachments,
+                Stage::Enable,
+                object,
+                &mut env,
+            );
         }
     }
 
-    fn run_ready(&mut self, listener: &mut dyn Listener, report: &mut FrameReport) {
-        let ids = std::mem::take(&mut self.pending_ready);
+    fn ready(&mut self, listener: &mut dyn Listener, report: &mut FrameReport) {
+        let ids = std::mem::take(&mut self.life.pending_ready);
         let Self {
-            world,
-            commands,
-            input,
-            time,
-            loaded,
-            active,
-            pending_ready,
-            attachments,
+            core,
+            life,
+            scripts,
             ..
         } = self;
-        let mut env = Env {
-            world: &*world,
-            commands: &mut *commands,
-            input: &*input,
-            time: *time,
-            failures: &mut report.script_failures,
-        };
+        let mut env = env(core, &mut report.script_failures);
         for id in ids {
-            let Some(entry) = loaded.get_mut(&id) else {
+            let Some(entry) = life.loaded.get_mut(&id) else {
                 continue;
             };
             if entry.ready {
                 continue;
             }
             if !entry.enabled {
-                pending_ready.insert(id);
+                life.pending_ready.insert(id);
                 continue;
             }
             entry.ready = true;
             let object = entry.handle;
-            active.insert(id, object);
-            emit(listener, attachments, Stage::Ready, object, &mut env);
+            life.active.insert(id, object);
+            emit(
+                listener,
+                &mut scripts.attachments,
+                Stage::Ready,
+                object,
+                &mut env,
+            );
         }
     }
 
-    fn run_frame_stage(
-        &mut self,
-        stage: Stage,
-        listener: &mut dyn Listener,
-        report: &mut FrameReport,
-    ) {
+    fn frame_stage(&mut self, stage: Stage, listener: &mut dyn Listener, report: &mut FrameReport) {
         let Self {
-            world,
-            commands,
-            input,
-            time,
-            active,
-            attachments,
+            core,
+            life,
+            scripts,
             ..
         } = self;
-        let mut env = Env {
-            world: &*world,
-            commands: &mut *commands,
-            input: &*input,
-            time: *time,
-            failures: &mut report.script_failures,
-        };
-        for object in active.values().copied() {
-            emit(listener, attachments, stage, object, &mut env);
+        let mut env = env(core, &mut report.script_failures);
+        for object in life.active.values().copied() {
+            emit(listener, &mut scripts.attachments, stage, object, &mut env);
         }
     }
 
-    fn run_disable(&mut self, listener: &mut dyn Listener, report: &mut FrameReport) {
+    fn disable(&mut self, listener: &mut dyn Listener, report: &mut FrameReport) {
         let requests = self.take_enable_requests(false);
         let Self {
-            world,
-            commands,
-            input,
-            time,
-            loaded,
-            active,
-            pending_ready,
-            attachments,
+            core,
+            life,
+            scripts,
             ..
         } = self;
-        let mut env = Env {
-            world: &*world,
-            commands: &mut *commands,
-            input: &*input,
-            time: *time,
-            failures: &mut report.script_failures,
-        };
+        let mut env = env(core, &mut report.script_failures);
         for object in requests {
-            let Some(id) = world.id(object) else {
-                record_skip(
-                    &mut report.skipped,
-                    Skipped {
-                        command: "set_enabled",
-                        handle: object,
-                        reason: SkipReason::StaleHandle,
-                    },
-                );
+            let Some(id) = env.world.id(object) else {
+                report.skipped.push(Skipped {
+                    command: "set_enabled",
+                    handle: object,
+                    reason: SkipReason::StaleHandle,
+                });
                 continue;
             };
-            let Some(entry) = loaded.get_mut(&id) else {
-                record_skip(
-                    &mut report.skipped,
-                    Skipped {
-                        command: "set_enabled",
-                        handle: object,
-                        reason: SkipReason::NotLoaded,
-                    },
-                );
+            let Some(entry) = life.loaded.get_mut(&id) else {
+                report.skipped.push(Skipped {
+                    command: "set_enabled",
+                    handle: object,
+                    reason: SkipReason::NotLoaded,
+                });
                 continue;
             };
             if !entry.enabled {
                 continue;
             }
             entry.enabled = false;
-            active.remove(&id);
-            pending_ready.remove(&id);
-            emit(listener, attachments, Stage::Disable, object, &mut env);
+            life.active.remove(&id);
+            life.pending_ready.remove(&id);
+            emit(
+                listener,
+                &mut scripts.attachments,
+                Stage::Disable,
+                object,
+                &mut env,
+            );
         }
     }
 
-    fn run_unload(&mut self, listener: &mut dyn Listener, report: &mut FrameReport) {
-        let requests = std::mem::take(&mut self.pending_unload);
+    fn unload(&mut self, listener: &mut dyn Listener, report: &mut FrameReport) {
+        let requests = std::mem::take(&mut self.life.pending_unload);
         let Self {
-            world,
-            commands,
-            input,
-            time,
-            loaded,
-            active,
-            pending_ready,
-            attachments,
-            overrides_applied,
+            core,
+            life,
+            scripts,
             ..
         } = self;
         for request in requests {
-            if !world.contains(request.handle) {
-                record_skip(
-                    &mut report.skipped,
-                    Skipped {
-                        command: if request.despawn { "despawn" } else { "unload" },
-                        handle: request.handle,
-                        reason: SkipReason::StaleHandle,
-                    },
-                );
+            if !core.world.contains(request.handle) {
+                report.skipped.push(Skipped {
+                    command: if request.despawn { "despawn" } else { "unload" },
+                    handle: request.handle,
+                    reason: SkipReason::StaleHandle,
+                });
                 continue;
             }
-            let subtree = subtree_postorder(world, request.handle);
+            let subtree = subtree_postorder(&core.world, request.handle);
             {
-                let mut env = Env {
-                    world: &*world,
-                    commands: &mut *commands,
-                    input: &*input,
-                    time: *time,
-                    failures: &mut report.script_failures,
-                };
+                let mut env = env(core, &mut report.script_failures);
                 for object in subtree.iter().copied() {
-                    let Some(id) = world.id(object) else {
+                    let Some(id) = env.world.id(object) else {
                         continue;
                     };
-                    let Some(entry) = loaded.remove(&id) else {
+                    let Some(entry) = life.loaded.remove(&id) else {
                         continue;
                     };
-                    active.remove(&id);
-                    pending_ready.remove(&id);
+                    life.active.remove(&id);
+                    life.pending_ready.remove(&id);
                     if entry.enabled {
-                        emit(listener, attachments, Stage::Disable, object, &mut env);
+                        emit(
+                            listener,
+                            &mut scripts.attachments,
+                            Stage::Disable,
+                            object,
+                            &mut env,
+                        );
                     }
-                    emit(listener, attachments, Stage::Unload, object, &mut env);
+                    emit(
+                        listener,
+                        &mut scripts.attachments,
+                        Stage::Unload,
+                        object,
+                        &mut env,
+                    );
                 }
             }
             if request.despawn {
                 for object in &subtree {
-                    attachments.by_object.remove(object);
-                    overrides_applied.remove(object);
+                    scripts.attachments.by_object.remove(object);
+                    scripts.overrides_applied.remove(object);
                 }
-                world.despawn(request.handle);
+                core.world.despawn(request.handle);
             }
         }
+    }
+}
+
+fn env<'a>(core: &'a mut Core, failures: &'a mut Vec<ScriptFailure>) -> Env<'a> {
+    Env {
+        world: &core.world,
+        commands: &mut core.commands,
+        input: &core.input,
+        time: core.time,
+        failures,
     }
 }
 
 fn apply_platform_overrides(
     object: ObjectHandle,
     world: &ObjectWorld,
-    platform: Option<PlatformKey>,
-    registry: &HashMap<String, Factory>,
-    attachments: &mut Attachments,
-    applied: &mut HashSet<ObjectHandle>,
+    scripts: &mut Scripts,
     errors: &mut Vec<AttachError>,
 ) {
-    let Some(platform) = platform else {
+    let Some(platform) = scripts.platform else {
         return;
     };
-    if !world.has_component::<PlatformOverride>(object) || !applied.insert(object) {
+    if !world.has_component::<PlatformOverride>(object) || !scripts.overrides_applied.insert(object)
+    {
         return;
     }
     let names = world
@@ -776,23 +810,13 @@ fn apply_platform_overrides(
         })
         .unwrap_or_default();
     for name in names {
-        match registry.get(&name) {
+        match scripts.registry.get(&name) {
             Some(factory) => {
-                push_script(attachments, object, factory());
+                push_script(&mut scripts.attachments, object, factory());
             }
             None => errors.push(AttachError::UnknownScript(name)),
         }
     }
-}
-
-fn record_skip(skipped: &mut Vec<Skipped>, entry: Skipped) {
-    if cfg!(debug_assertions) {
-        eprintln!(
-            "skipped {} on {:?}: {:?}",
-            entry.command, entry.handle, entry.reason
-        );
-    }
-    skipped.push(entry);
 }
 
 fn subtree_preorder(world: &ObjectWorld, root: ObjectHandle) -> Vec<ObjectHandle> {

@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::component::{
     Component, ComponentSchema, DecodeError, Field, FieldSchema, Value, take_field,
 };
@@ -17,6 +19,33 @@ impl ObjectId {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ObjectHandle(pub(crate) hecs::Entity);
+
+#[derive(Default)]
+pub(crate) struct HandleHasher(u64);
+
+const HASH_K: u64 = 0x517c_c1b7_2722_0a95;
+
+impl std::hash::Hasher for HandleHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 = (self.0.rotate_left(5) ^ u64::from(byte)).wrapping_mul(HASH_K);
+        }
+    }
+
+    fn write_u32(&mut self, value: u32) {
+        self.0 = (self.0.rotate_left(5) ^ u64::from(value)).wrapping_mul(HASH_K);
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.0 = (self.0.rotate_left(5) ^ value).wrapping_mul(HASH_K);
+    }
+}
+
+pub(crate) type HandleBuild = std::hash::BuildHasherDefault<HandleHasher>;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Transform {
@@ -64,7 +93,7 @@ impl Component for Transform {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Name {
-    pub value: String,
+    pub value: Arc<str>,
 }
 
 impl Component for Name {

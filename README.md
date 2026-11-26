@@ -13,6 +13,12 @@ scripts/check.sh          # Linux and macOS: format, lint, build, test
 scripts/check.ps1         # Windows PowerShell: the same checks
 ```
 
+Measure the heart's tick cost on this machine (release build, best of seven runs):
+
+```
+cargo run --release -p heart-bench
+```
+
 Run the Phase 0 triangle:
 
 ```
@@ -44,6 +50,7 @@ Platform detection is automatic. On Linux, `PlatformKey::current()` returns `Lin
 crates/weave-heart    the shared core: objects, components, scripts, lifecycle
 crates/weave-macros   derive macros for components
 examples/triangle     the Phase 0 wgpu triangle
+examples/heart-bench  tick-cost benchmark for WeaveHeart
 docs/                 plan decisions, service reference
 scripts/              check scripts for each platform, and the Linux smoke test
 ```

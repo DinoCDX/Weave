@@ -5,7 +5,8 @@ use std::marker::PhantomData;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use crate::command::CommandBuffer;
-use crate::object::{ObjectHandle, ObjectId};
+use crate::component::Component;
+use crate::object::{HandleBuild, ObjectHandle, ObjectId, Transform};
 use crate::services::{Contains, Input, InputFrame, InputView, Scene, SceneView, Time, TimeView};
 use crate::stage::{Env, Stage};
 use crate::world::ObjectWorld;
@@ -57,6 +58,36 @@ impl<'a, S> ScriptContext<'a, S> {
         &mut *self.raw.commands
     }
 
+    pub fn set_transform(&mut self, transform: Transform) {
+        let object = self.raw.object;
+        self.raw.commands.set_transform(object, transform);
+    }
+
+    pub fn set_enabled(&mut self, enabled: bool) {
+        let object = self.raw.object;
+        self.raw.commands.set_enabled(object, enabled);
+    }
+
+    pub fn despawn(&mut self) {
+        let object = self.raw.object;
+        self.raw.commands.despawn(object);
+    }
+
+    pub fn reparent(&mut self, parent: Option<ObjectHandle>) {
+        let object = self.raw.object;
+        self.raw.commands.reparent(object, parent);
+    }
+
+    pub fn insert_component<C: Component>(&mut self, component: C) {
+        let object = self.raw.object;
+        self.raw.commands.insert_component(object, component);
+    }
+
+    pub fn edit_component<C: Component>(&mut self, edit: impl FnOnce(&mut C) + Send + 'static) {
+        let object = self.raw.object;
+        self.raw.commands.edit_component::<C>(object, edit);
+    }
+
     pub fn time<I>(&self) -> TimeView
     where
         S: Contains<Time, I>,
@@ -106,7 +137,7 @@ pub(crate) struct Attachment {
 
 #[derive(Default)]
 pub(crate) struct Attachments {
-    pub(crate) by_object: HashMap<ObjectHandle, Vec<Attachment>>,
+    pub(crate) by_object: HashMap<ObjectHandle, Vec<Attachment>, HandleBuild>,
     pub(crate) unstarted: BTreeMap<ObjectId, ObjectHandle>,
 }
 
@@ -156,7 +187,6 @@ pub(crate) fn invoke(
             stage,
             message: panic_message(payload.as_ref()),
         };
-        eprintln!("{failure}");
         env.failures.push(failure);
     }
 }

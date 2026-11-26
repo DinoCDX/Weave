@@ -1,9 +1,10 @@
 use std::any::TypeId;
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use crate::component::Component;
 use crate::error::{ReparentError, SpawnError};
-use crate::object::{Name, ObjectHandle, ObjectId, Transform};
+use crate::object::{HandleBuild, Name, ObjectHandle, ObjectId, Transform};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct IdTag(ObjectId);
@@ -14,11 +15,11 @@ pub(crate) struct ParentLink(Option<ObjectHandle>);
 #[derive(Default)]
 struct Children {
     by_id: BTreeMap<ObjectId, ObjectHandle>,
-    by_name: HashMap<Box<str>, ObjectHandle>,
+    by_name: HashMap<Arc<str>, ObjectHandle>,
 }
 
 impl Children {
-    fn insert(&mut self, id: ObjectId, name: Box<str>, handle: ObjectHandle) {
+    fn insert(&mut self, id: ObjectId, name: Arc<str>, handle: ObjectHandle) {
         self.by_id.insert(id, handle);
         self.by_name.insert(name, handle);
     }
@@ -27,12 +28,16 @@ impl Children {
         self.by_id.remove(&id);
         self.by_name.remove(name);
     }
+
+    fn contains_name(&self, name: &str) -> bool {
+        self.by_name.contains_key(name)
+    }
 }
 
 pub struct ObjectWorld {
     store: hecs::World,
     by_id: BTreeMap<ObjectId, ObjectHandle>,
-    children: HashMap<ObjectHandle, Children>,
+    children: HashMap<ObjectHandle, Children, HandleBuild>,
     roots: Children,
     next_id: u64,
 }
@@ -48,7 +53,7 @@ impl ObjectWorld {
         Self {
             store: hecs::World::new(),
             by_id: BTreeMap::new(),
-            children: HashMap::new(),
+            children: HashMap::default(),
             roots: Children::default(),
             next_id: 1,
         }
@@ -128,17 +133,15 @@ impl ObjectWorld {
 
         let id = self.id_of(object).expect("live objects have an id");
         let name = self.name_of(object).expect("live objects have a name");
-        if self
-            .siblings_checked(parent)
-            .by_name
-            .contains_key(name.as_str())
-        {
-            return Err(ReparentError::DuplicateName { parent, name });
+        if self.siblings_checked(parent).contains_name(&name) {
+            return Err(ReparentError::DuplicateName {
+                parent,
+                name: name.to_string(),
+            });
         }
 
         self.siblings_mut(old_parent).remove(id, &name);
-        self.siblings_mut(parent)
-            .insert(id, name.into_boxed_str(), object);
+        self.siblings_mut(parent).insert(id, name, object);
         if let Ok(mut link) = self.store.get::<&mut ParentLink>(object.0) {
             link.0 = parent;
         }
@@ -161,7 +164,7 @@ impl ObjectWorld {
         self.by_id.values().copied()
     }
 
-    pub fn name(&self, handle: ObjectHandle) -> Option<String> {
+    pub fn name(&self, handle: ObjectHandle) -> Option<Arc<str>> {
         self.name_of(handle)
     }
 
@@ -169,8 +172,16 @@ impl ObjectWorld {
         self.parent_link(handle)
     }
 
+    pub fn parent_of(&self, handle: ObjectHandle) -> Option<ObjectHandle> {
+        self.parent_link(handle).flatten()
+    }
+
+    pub fn is_root(&self, handle: ObjectHandle) -> Option<bool> {
+        self.parent_link(handle).map(|parent| parent.is_none())
+    }
+
     pub fn path(&self, handle: ObjectHandle) -> Option<String> {
-        let mut segments = Vec::new();
+        let mut segments: Vec<Arc<str>> = Vec::new();
         let mut current = Some(handle);
         while let Some(h) = current {
             segments.push(self.name_of(h)?);
@@ -234,7 +245,7 @@ impl ObjectWorld {
         self.store
             .get::<&C>(object.0)
             .ok()
-            .map(|component| f(&*component))
+            .map(|component| f(&component))
     }
 
     pub fn with_component_mut<C: Component, R>(
@@ -248,7 +259,7 @@ impl ObjectWorld {
         self.store
             .get::<&mut C>(object.0)
             .ok()
-            .map(|mut component| f(&mut *component))
+            .map(|mut component| f(&mut component))
     }
 
     pub fn remove_component<C: Component>(&mut self, object: ObjectHandle) -> Option<C> {
@@ -268,24 +279,25 @@ impl ObjectWorld {
         if self.by_id.contains_key(&id) {
             return Err(SpawnError::DuplicateId(id));
         }
-        if self.siblings(parent)?.by_name.contains_key(name) {
+        if self.siblings_checked_result(parent)?.contains_name(name) {
             return Err(SpawnError::DuplicateName {
                 parent,
                 name: name.to_owned(),
             });
         }
 
+        let shared: Arc<str> = Arc::from(name);
         let handle = ObjectHandle(self.store.spawn((
             IdTag(id),
             Name {
-                value: name.to_owned(),
+                value: Arc::clone(&shared),
             },
             ParentLink(parent),
             Transform::default(),
         )));
         self.by_id.insert(id, handle);
         self.children.insert(handle, Children::default());
-        self.siblings_mut(parent).insert(id, name.into(), handle);
+        self.siblings_mut(parent).insert(id, shared, handle);
         Ok(handle)
     }
 
@@ -293,11 +305,11 @@ impl ObjectWorld {
         self.store.get::<&IdTag>(handle.0).ok().map(|tag| tag.0)
     }
 
-    fn name_of(&self, handle: ObjectHandle) -> Option<String> {
+    fn name_of(&self, handle: ObjectHandle) -> Option<Arc<str>> {
         self.store
             .get::<&Name>(handle.0)
             .ok()
-            .map(|name| name.value.clone())
+            .map(|name| Arc::clone(&name.value))
     }
 
     fn parent_link(&self, handle: ObjectHandle) -> Option<Option<ObjectHandle>> {
@@ -318,7 +330,10 @@ impl ObjectWorld {
         false
     }
 
-    fn siblings(&self, parent: Option<ObjectHandle>) -> Result<&Children, SpawnError> {
+    fn siblings_checked_result(
+        &self,
+        parent: Option<ObjectHandle>,
+    ) -> Result<&Children, SpawnError> {
         match parent {
             None => Ok(&self.roots),
             Some(p) => self.children.get(&p).ok_or(SpawnError::StaleParent(p)),

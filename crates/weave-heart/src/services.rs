@@ -109,7 +109,7 @@ impl<'a> SceneView<'a> {
         self.world.id(object)
     }
 
-    pub fn name(self, object: ObjectHandle) -> Option<String> {
+    pub fn name(self, object: ObjectHandle) -> Option<std::sync::Arc<str>> {
         self.world.name(object)
     }
 

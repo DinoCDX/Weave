@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/weave-heart", "crates/weave-macros", "examples/triangle"]
+members = ["crates/weave-heart", "crates/weave-macros", "examples/triangle", "examples/heart-bench"]
 
 [workspace.package]
 edition = "2024"

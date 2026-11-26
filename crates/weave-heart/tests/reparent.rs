@@ -159,7 +159,7 @@ fn reserved_components_cannot_be_replaced_or_removed_through_the_generic_api() {
     assert_eq!(world.name(object).as_deref(), Some("guarded"));
     assert!(
         world
-            .with_component_mut::<Name, _>(object, |n| n.value.clear())
+            .with_component_mut::<Name, _>(object, |n| n.value = "".into())
             .is_none()
     );
     assert_eq!(world.name(object).as_deref(), Some("guarded"));
