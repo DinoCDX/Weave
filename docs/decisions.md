@@ -149,3 +149,37 @@ The project was built and tested with Rust 1.89.0 (`cargo build`, `cargo test`, 
 | D-74 | Services as a trait parameter | `Script<S = ()>` takes the services type as a parameter with a default of `()`. A script with no services is `impl Script for X` and writes no declaration. A script that uses services declares them once, in the impl header: `impl Script<(Time, Scene)> for X`. Hooks take `ScriptContext<'_, S>`, and `ScriptContext` defaults to `()`. Undeclared use still fails to compile, for scripts with and without services. | Confirmed by tests and compile-fail examples |
 | D-75 | Erasure | The runtime builds the erased dispatcher inside the generic `attach` and `register_script` calls, where the services type is known. The erased value is a generic adapter over the script and its services type, so no blanket impl over an unconstrained parameter is needed. Stored state is read back through the adapter. | Confirmed by tests |
 | D-76 | Measured cost | The benchmark's all-scripted case ranged from 36 to 64 ns per object across identical runs on this virtual machine. The services change does not show a measurable difference, and no speed claim is made for it. | Measured; noise exceeds the effect |
+
+## Benchmark documentation
+
+| ID | Decision | Choice | Status |
+|---|---|---|---|
+| D-77 | Every benchmark is logged | `docs/benchmarks.md` holds every benchmark run, with its command, environment, raw result, and what it does not show. A change that claims a speed effect must add an entry. Entries are never edited; a new run is a new entry that names the one it replaces. Superseded noisy runs stay in a history table, marked not comparable. | Confirmed |
+
+## Renderer E3.1
+
+| ID | Decision | Choice | Status |
+|---|---|---|---|
+| D-78 | Math library | Vectors and matrices come from `glam` 0.34.3 (Rust 1.85, below the pinned 1.89). The heart still stores transforms as arrays, so math is not a project module yet. | Confirmed |
+| D-79 | Projection convention | The camera uses `glam::camera::rh::proj::directx::perspective`, the DirectX and WebGPU convention: depth 0 to 1, Y up, which matches wgpu. | Confirmed by test (target centred, depth in range) |
+| D-80 | Backend choice | DX12 on Windows, Vulkan on Linux, from the platform key. Other platforms use all backends. The choice is explicit because wgpu enables every backend by default. | Confirmed by tests |
+| D-81 | Render graph | Passes declare what they read and write, and the graph rejects a read that no earlier pass wrote, a duplicate name, and a bad order. Each pass's CPU time is measured. `report()` prints the table. | Confirmed by tests |
+| D-82 | Passes in E3.1 | `clear`, `opaque`, `transparent`, `post`. `transparent` and `post` record nothing yet; they exist so the graph has its final shape. | Confirmed |
+| D-83 | Instance data | Model matrix and colour are per-instance vertex data, written once per frame into a buffer that grows by powers of two. One draw call covers all instances. This is the instancing that E3.3 will measure. | Confirmed by the cube example |
+| D-84 | Lighting | Lambert shading from one directional light, with an ambient term and an exposure multiplier. No back-face culling yet (E3.4). | Confirmed by screenshot |
+| D-85 | Renderable component | `Renderable { color }` is a heart component, derived with `weave_macros::Component`. `collect_instances` reads loaded, enabled objects that have a `Renderable` and a `Transform`. | Confirmed by tests |
+| D-86 | Window ownership | The renderer takes any surface target. It does not depend on winit. The cube example owns the window, until `weave-platform` exists. | Confirmed |
+| D-87 | Exit criterion status | Lit cube verified on Linux under Xvfb with lavapipe (screenshot and video). Windows not run. The loom report of passes is not built yet; the graph's own report is the stand-in. | Partly met |
+
+## Renderer E3.2 to E3.4
+
+| ID | Decision | Choice | Status |
+|---|---|---|---|
+| D-88 | Shader hot reload | `use_shader_file` loads a file and builds from it. `reload_shader` is called once per frame and compares the file's modification time, so an unchanged file costs one metadata read. | Confirmed by B-005 (1.3 ms) |
+| D-89 | Broken edits | A build runs inside a validation error scope. A failed build is reported as `ShaderError::Compile`, and the previous pipeline stays active. The error text is kept in `shader_error()` until the next good build. | Confirmed by B-005 |
+| D-90 | Content-hash cache | Pipelines are cached by a 64-bit FNV-1a hash of the shader text, up to eight entries, evicting the oldest that is not active. Returning to a cached text switches with no recompile. | Confirmed by B-005 (`FromCache`) |
+| D-91 | Batched and unbatched drawing | `DrawMode::Batched` is one instanced draw. `DrawMode::Unbatched` issues one draw per instance, with the same data. The second exists so the batching benefit can be measured against it. | Confirmed by B-004 (about 33 to 40 times less CPU recording) |
+| D-92 | Frustum culling | Planes come from the view-projection matrix in the DirectX/WebGPU depth convention. Each instance is tested against its bounding sphere, with radius from the largest scale axis. Culling is off by default and turned on with `set_culling`. | Confirmed by unit tests and B-004 (5,068 of 10,000 kept) |
+| D-93 | GPU timing gap | Frame times on this host (lavapipe, shared VM) vary by 10 to 15% between runs, which hides the frame-time effect of culling. GPU timestamp queries would measure the GPU work directly. Not built yet; the plan needs them for a stable E3.4 result. | Open |
+| D-94 | Windows compile check | The whole workspace type-checks for `x86_64-pc-windows-msvc`. Nothing has been run on Windows. | Partly met |
+| D-95 | Frame stats | `draw` returns `FrameStats` with the submitted count, the drawn count, and the CPU time of culling. `wait_idle` blocks until the GPU is done, for synchronised timing. | Confirmed |

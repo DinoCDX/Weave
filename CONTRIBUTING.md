@@ -33,4 +33,5 @@ Use `--locked` so the build matches `Cargo.lock`. If a dependency change is inte
 - Every merged change includes its tests.
 - Public behaviour that scripts depend on gets a test that names the rule it checks.
 - Efficiency changes include before and after numbers on both reference tiers (see the plan, Section 9).
+- Every benchmark run is logged in `docs/benchmarks.md` with its command, environment, and result (decision D-77). Add the entry in the same change that makes the claim.
 - Decisions that change a recorded choice get an entry in `docs/decisions.md`.

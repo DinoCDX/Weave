@@ -1,0 +1,13 @@
+[package]
+name = "cube"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+glam = "0.34"
+weave-eye = { path = "../../crates/weave-eye" }
+weave-heart = { path = "../../crates/weave-heart" }
+winit = "0.30"

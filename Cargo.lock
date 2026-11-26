@@ -321,6 +321,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
+name = "cube"
+version = "0.0.0"
+dependencies = [
+ "glam",
+ "weave-eye",
+ "weave-heart",
+ "winit",
+]
+
+[[package]]
 name = "cursor-icon"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -484,6 +494,12 @@ dependencies = [
  "log",
  "xml-rs",
 ]
+
+[[package]]
+name = "glam"
+version = "0.34.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "627003914c6057c9c8f0832ee4f870b5a4f599d0cfa83f4072675114860cd0ff"
 
 [[package]]
 name = "glow"
@@ -1389,6 +1405,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "render-bench"
+version = "0.0.0"
+dependencies = [
+ "glam",
+ "weave-eye",
+ "winit",
+]
+
+[[package]]
 name = "renderdoc-sys"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1977,6 +2002,17 @@ dependencies = [
  "log",
  "once_cell",
  "pkg-config",
+]
+
+[[package]]
+name = "weave-eye"
+version = "0.0.0"
+dependencies = [
+ "glam",
+ "pollster",
+ "weave-heart",
+ "weave-macros",
+ "wgpu",
 ]
 
 [[package]]
