@@ -19,14 +19,12 @@ struct Counter {
     last_dt: f32,
 }
 
-impl Script for Counter {
-    type Services = (Time, Scene);
-
-    fn on_load(&mut self, cx: &mut ScriptContext<'_, Self::Services>) {
+impl Script<(Time, Scene)> for Counter {
+    fn on_load(&mut self, cx: &mut ScriptContext<'_, (Time, Scene)>) {
         self.owner = cx.scene().id(cx.object()).map(|id| id.get());
     }
 
-    fn on_update(&mut self, cx: &mut ScriptContext<'_, Self::Services>) {
+    fn on_update(&mut self, cx: &mut ScriptContext<'_, (Time, Scene)>) {
         self.ticks += 1;
         self.last_dt = cx.time().delta();
     }
@@ -38,27 +36,25 @@ struct Recorder {
 }
 
 impl Script for Recorder {
-    type Services = ();
-
-    fn on_load(&mut self, _: &mut ScriptContext<'_, ()>) {
+    fn on_load(&mut self, _: &mut ScriptContext<'_>) {
         self.log.push("load");
     }
-    fn on_enable(&mut self, _: &mut ScriptContext<'_, ()>) {
+    fn on_enable(&mut self, _: &mut ScriptContext<'_>) {
         self.log.push("enable");
     }
-    fn on_ready(&mut self, _: &mut ScriptContext<'_, ()>) {
+    fn on_ready(&mut self, _: &mut ScriptContext<'_>) {
         self.log.push("ready");
     }
-    fn on_update(&mut self, _: &mut ScriptContext<'_, ()>) {
+    fn on_update(&mut self, _: &mut ScriptContext<'_>) {
         self.log.push("update");
     }
-    fn on_late_update(&mut self, _: &mut ScriptContext<'_, ()>) {
+    fn on_late_update(&mut self, _: &mut ScriptContext<'_>) {
         self.log.push("late");
     }
-    fn on_disable(&mut self, _: &mut ScriptContext<'_, ()>) {
+    fn on_disable(&mut self, _: &mut ScriptContext<'_>) {
         self.log.push("disable");
     }
-    fn on_unload(&mut self, _: &mut ScriptContext<'_, ()>) {
+    fn on_unload(&mut self, _: &mut ScriptContext<'_>) {
         self.log.push("unload");
     }
 }
@@ -69,9 +65,7 @@ struct Tagged {
 }
 
 impl Script for Tagged {
-    type Services = ();
-
-    fn on_update(&mut self, _: &mut ScriptContext<'_, ()>) {
+    fn on_update(&mut self, _: &mut ScriptContext<'_>) {
         self.sink.lock().unwrap().push(self.tag);
     }
 }
@@ -81,9 +75,7 @@ struct Mover {
 }
 
 impl Script for Mover {
-    type Services = ();
-
-    fn on_update(&mut self, cx: &mut ScriptContext<'_, ()>) {
+    fn on_update(&mut self, cx: &mut ScriptContext<'_>) {
         let object = cx.object();
         cx.commands().set_transform(object, self.target);
     }

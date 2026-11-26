@@ -12,16 +12,12 @@ impl Listener for Silent {
 #[derive(Default)]
 struct WinOnly;
 
-impl Script for WinOnly {
-    type Services = ();
-}
+impl Script for WinOnly {}
 
 #[derive(Default)]
 struct LinuxOnly;
 
-impl Script for LinuxOnly {
-    type Services = ();
-}
+impl Script for LinuxOnly {}
 
 fn setup(rt: &mut Runtime, overrides: PlatformOverride) -> ObjectHandle {
     rt.register_script("WinOnly", WinOnly::default).unwrap();

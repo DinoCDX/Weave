@@ -22,9 +22,7 @@ struct Counter {
 }
 
 impl Script for Counter {
-    type Services = ();
-
-    fn on_update(&mut self, _cx: &mut ScriptContext<'_, ()>) {
+    fn on_update(&mut self, _cx: &mut ScriptContext<'_>) {
         self.ticks += 1;
     }
 }
@@ -35,9 +33,7 @@ struct Attacher {
 }
 
 impl Script for Attacher {
-    type Services = ();
-
-    fn on_update(&mut self, cx: &mut ScriptContext<'_, ()>) {
+    fn on_update(&mut self, cx: &mut ScriptContext<'_>) {
         if !self.done {
             self.done = true;
             let target = self.target;

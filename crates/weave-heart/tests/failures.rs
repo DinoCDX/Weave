@@ -12,9 +12,7 @@ struct Fragile {
 }
 
 impl Script for Fragile {
-    type Services = ();
-
-    fn on_update(&mut self, _cx: &mut weave_heart::ScriptContext<'_, ()>) {
+    fn on_update(&mut self, _cx: &mut weave_heart::ScriptContext<'_>) {
         self.calls += 1;
         if self.calls == 2 {
             panic!("count {}", self.calls);
@@ -28,9 +26,7 @@ struct Steady {
 }
 
 impl Script for Steady {
-    type Services = ();
-
-    fn on_update(&mut self, _cx: &mut weave_heart::ScriptContext<'_, ()>) {
+    fn on_update(&mut self, _cx: &mut weave_heart::ScriptContext<'_>) {
         self.updates += 1;
     }
 }
@@ -39,9 +35,7 @@ impl Script for Steady {
 struct BadLoad;
 
 impl Script for BadLoad {
-    type Services = ();
-
-    fn on_load(&mut self, _cx: &mut weave_heart::ScriptContext<'_, ()>) {
+    fn on_load(&mut self, _cx: &mut weave_heart::ScriptContext<'_>) {
         panic!("bad load");
     }
 }

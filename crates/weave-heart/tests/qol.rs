@@ -103,6 +103,4 @@ fn objects_iterate_in_stable_id_order_and_skip_despawned_ones() {
 #[derive(Default)]
 struct NoopScript;
 
-impl weave_heart::Script for NoopScript {
-    type Services = ();
-}
+impl weave_heart::Script for NoopScript {}

@@ -1,6 +1,6 @@
 use crate::component::Component;
 use crate::object::{ObjectHandle, Transform};
-use crate::script::{ErasedScript, Script};
+use crate::script::{ErasedScript, Script, erase};
 use crate::world::ObjectWorld;
 
 pub(crate) type Edit = Box<dyn FnOnce(&mut ObjectWorld, ObjectHandle) -> bool + Send>;
@@ -115,10 +115,14 @@ impl CommandBuffer {
         });
     }
 
-    pub fn attach<S: Script>(&mut self, object: ObjectHandle, script: S) {
+    pub fn attach<S, T>(&mut self, object: ObjectHandle, script: T)
+    where
+        S: 'static,
+        T: Script<S>,
+    {
         self.queue.push(Command::Attach {
             object,
-            script: Box::new(script),
+            script: erase::<S, T>(script),
         });
     }
 

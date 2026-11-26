@@ -11,22 +11,20 @@ use crate::services::{Contains, Input, InputFrame, InputView, Scene, SceneView, 
 use crate::stage::{Env, Stage};
 use crate::world::ObjectWorld;
 
-pub trait Script: Send + 'static {
-    type Services;
+pub trait Script<S = ()>: Send + 'static {
+    fn on_load(&mut self, _cx: &mut ScriptContext<'_, S>) {}
 
-    fn on_load(&mut self, _cx: &mut ScriptContext<'_, Self::Services>) {}
+    fn on_enable(&mut self, _cx: &mut ScriptContext<'_, S>) {}
 
-    fn on_enable(&mut self, _cx: &mut ScriptContext<'_, Self::Services>) {}
+    fn on_ready(&mut self, _cx: &mut ScriptContext<'_, S>) {}
 
-    fn on_ready(&mut self, _cx: &mut ScriptContext<'_, Self::Services>) {}
+    fn on_update(&mut self, _cx: &mut ScriptContext<'_, S>) {}
 
-    fn on_update(&mut self, _cx: &mut ScriptContext<'_, Self::Services>) {}
+    fn on_late_update(&mut self, _cx: &mut ScriptContext<'_, S>) {}
 
-    fn on_late_update(&mut self, _cx: &mut ScriptContext<'_, Self::Services>) {}
+    fn on_disable(&mut self, _cx: &mut ScriptContext<'_, S>) {}
 
-    fn on_disable(&mut self, _cx: &mut ScriptContext<'_, Self::Services>) {}
-
-    fn on_unload(&mut self, _cx: &mut ScriptContext<'_, Self::Services>) {}
+    fn on_unload(&mut self, _cx: &mut ScriptContext<'_, S>) {}
 }
 
 pub(crate) struct RawContext<'a> {
@@ -37,7 +35,7 @@ pub(crate) struct RawContext<'a> {
     pub(crate) time: TimeView,
 }
 
-pub struct ScriptContext<'a, S> {
+pub struct ScriptContext<'a, S = ()> {
     raw: RawContext<'a>,
     services: PhantomData<fn() -> S>,
 }
@@ -110,23 +108,41 @@ impl<'a, S> ScriptContext<'a, S> {
     }
 }
 
-pub(crate) trait ErasedScript: Any + Send {
+pub(crate) trait ErasedScript: Send {
     fn dispatch(&mut self, stage: Stage, raw: RawContext<'_>);
+
+    fn inner(&self) -> &dyn Any;
 }
 
-impl<T: Script> ErasedScript for T {
+struct Adapter<T, S> {
+    script: T,
+    services: PhantomData<fn() -> S>,
+}
+
+impl<T: Script<S>, S: 'static> ErasedScript for Adapter<T, S> {
     fn dispatch(&mut self, stage: Stage, raw: RawContext<'_>) {
-        let mut cx = ScriptContext::<T::Services>::new(raw);
+        let mut cx = ScriptContext::<S>::new(raw);
         match stage {
-            Stage::Load => self.on_load(&mut cx),
-            Stage::Enable => self.on_enable(&mut cx),
-            Stage::Ready => self.on_ready(&mut cx),
-            Stage::Update => self.on_update(&mut cx),
-            Stage::LateUpdate => self.on_late_update(&mut cx),
-            Stage::Disable => self.on_disable(&mut cx),
-            Stage::Unload => self.on_unload(&mut cx),
+            Stage::Load => self.script.on_load(&mut cx),
+            Stage::Enable => self.script.on_enable(&mut cx),
+            Stage::Ready => self.script.on_ready(&mut cx),
+            Stage::Update => self.script.on_update(&mut cx),
+            Stage::LateUpdate => self.script.on_late_update(&mut cx),
+            Stage::Disable => self.script.on_disable(&mut cx),
+            Stage::Unload => self.script.on_unload(&mut cx),
         }
     }
+
+    fn inner(&self) -> &dyn Any {
+        &self.script
+    }
+}
+
+pub(crate) fn erase<S: 'static, T: Script<S>>(script: T) -> Box<dyn ErasedScript> {
+    Box::new(Adapter {
+        script,
+        services: PhantomData,
+    })
 }
 
 pub(crate) struct Attachment {

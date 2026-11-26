@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::fmt::Write as _;
@@ -9,8 +8,8 @@ use crate::error::{ReparentError, SpawnError};
 use crate::object::{HandleBuild, ObjectHandle, ObjectId};
 use crate::platform::{PlatformKey, PlatformOverride};
 use crate::script::{
-    AttachError, Attachments, ErasedScript, Factory, RegistryError, Script, ScriptFailure, invoke,
-    push_script,
+    AttachError, Attachments, ErasedScript, Factory, RegistryError, Script, ScriptFailure, erase,
+    invoke, push_script,
 };
 use crate::services::{InputFrame, TimeView};
 use crate::stage::{Env, Listener, NoListener, Stage, emit};
@@ -227,30 +226,31 @@ impl Runtime {
         self.life.loaded.len()
     }
 
-    pub fn register_script<S, F>(
+    pub fn register_script<S, T, F>(
         &mut self,
         name: impl Into<String>,
         factory: F,
     ) -> Result<(), RegistryError>
     where
-        S: Script,
-        F: Fn() -> S + 'static,
+        S: 'static,
+        T: Script<S>,
+        F: Fn() -> T + 'static,
     {
         let name = name.into();
         if self.scripts.registry.contains_key(&name) {
             return Err(RegistryError::Duplicate(name));
         }
-        let boxed: Factory = Box::new(move || -> Box<dyn ErasedScript> { Box::new(factory()) });
+        let boxed: Factory = Box::new(move || erase::<S, T>(factory()));
         self.scripts.registry.insert(name, boxed);
         Ok(())
     }
 
-    pub fn attach<S: Script>(
-        &mut self,
-        object: ObjectHandle,
-        script: S,
-    ) -> Result<usize, AttachError> {
-        self.attach_boxed(object, Box::new(script))
+    pub fn attach<S, T>(&mut self, object: ObjectHandle, script: T) -> Result<usize, AttachError>
+    where
+        S: 'static,
+        T: Script<S>,
+    {
+        self.attach_boxed(object, erase::<S, T>(script))
     }
 
     pub fn attach_modular(
@@ -273,17 +273,16 @@ impl Runtime {
             .map_or(0, Vec::len)
     }
 
-    pub fn script<T: Script>(&self, object: ObjectHandle, index: usize) -> Option<&T> {
-        let erased: &dyn ErasedScript = self
+    pub fn script<T: 'static>(&self, object: ObjectHandle, index: usize) -> Option<&T> {
+        let inner = self
             .scripts
             .attachments
             .by_object
             .get(&object)?
             .get(index)?
             .script
-            .as_ref();
-        let any: &dyn Any = erased;
-        any.downcast_ref::<T>()
+            .inner();
+        inner.downcast_ref::<T>()
     }
 
     pub fn update(&mut self, dt: f32) -> FrameReport {

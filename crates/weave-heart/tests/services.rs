@@ -16,10 +16,8 @@ struct Probe {
     own_path: Option<String>,
 }
 
-impl Script for Probe {
-    type Services = (Time, Input, Scene);
-
-    fn on_update(&mut self, cx: &mut ScriptContext<'_, Self::Services>) {
+impl Script<(Time, Input, Scene)> for Probe {
+    fn on_update(&mut self, cx: &mut ScriptContext<'_, (Time, Input, Scene)>) {
         self.delta = cx.time().delta();
         self.elapsed = cx.time().elapsed();
         self.jump_down = cx.input().is_down(KeyCode(32));

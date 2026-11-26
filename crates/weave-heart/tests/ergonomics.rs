@@ -15,9 +15,7 @@ struct Mover {
 }
 
 impl Script for Mover {
-    type Services = ();
-
-    fn on_update(&mut self, cx: &mut ScriptContext<'_, ()>) {
+    fn on_update(&mut self, cx: &mut ScriptContext<'_>) {
         if self.once {
             self.once = false;
             cx.set_transform(self.target);
@@ -31,9 +29,7 @@ impl Script for Mover {
 struct Doomed;
 
 impl Script for Doomed {
-    type Services = ();
-
-    fn on_update(&mut self, cx: &mut ScriptContext<'_, ()>) {
+    fn on_update(&mut self, cx: &mut ScriptContext<'_>) {
         cx.despawn();
     }
 }
@@ -41,9 +37,7 @@ impl Script for Doomed {
 struct Sleeper;
 
 impl Script for Sleeper {
-    type Services = ();
-
-    fn on_update(&mut self, cx: &mut ScriptContext<'_, ()>) {
+    fn on_update(&mut self, cx: &mut ScriptContext<'_>) {
         cx.set_enabled(false);
     }
 }

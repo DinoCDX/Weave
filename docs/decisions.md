@@ -140,4 +140,12 @@ The project was built and tested with Rust 1.89.0 (`cargo build`, `cargo test`, 
 | D-70 | Script helpers | `ScriptContext` acts on its own object directly: `set_transform`, `set_enabled`, `despawn`, `reparent`, `insert_component`, `edit_component`. These queue commands, so they take effect at the next frame boundary, as before. | Confirmed by tests |
 | D-71 | Parent accessors | `parent_of(h)` returns the parent handle, `is_root(h)` returns `Option<bool>`, and both return `None` for stale handles. `parent(h)` is kept and documents the nested form. | Confirmed by tests |
 | D-72 | Randomised tree test | `tests/model.rs` runs 40 seeded sequences of 300 random spawn, despawn, and re-parent operations against a reference model. After every step it checks the object count, id order, names, parents, paths, lookup by path, children, roots, and that stale handles stay dead. It also fails if a hard case never occurs (cycles, name clashes, stale targets). | Confirmed; 0 mismatches |
-| D-73 | Services boilerplate | `type Services = ();` cannot be removed on stable Rust. Associated type defaults are unstable, and removing the declaration would also remove the compile-time check that undeclared services fail. Kept as is. | Known limit |
+| D-73 | Services boilerplate | Superseded by D-74. | Superseded |
+
+## Services without boilerplate
+
+| ID | Decision | Choice | Status |
+|---|---|---|---|
+| D-74 | Services as a trait parameter | `Script<S = ()>` takes the services type as a parameter with a default of `()`. A script with no services is `impl Script for X` and writes no declaration. A script that uses services declares them once, in the impl header: `impl Script<(Time, Scene)> for X`. Hooks take `ScriptContext<'_, S>`, and `ScriptContext` defaults to `()`. Undeclared use still fails to compile, for scripts with and without services. | Confirmed by tests and compile-fail examples |
+| D-75 | Erasure | The runtime builds the erased dispatcher inside the generic `attach` and `register_script` calls, where the services type is known. The erased value is a generic adapter over the script and its services type, so no blanket impl over an unconstrained parameter is needed. Stored state is read back through the adapter. | Confirmed by tests |
+| D-76 | Measured cost | The benchmark's all-scripted case ranged from 36 to 64 ns per object across identical runs on this virtual machine. The services change does not show a measurable difference, and no speed claim is made for it. | Measured; noise exceeds the effect |

@@ -46,9 +46,7 @@ struct Spinner {
 }
 
 impl Script for Spinner {
-    type Services = ();
-
-    fn on_update(&mut self, _cx: &mut ScriptContext<'_, ()>) {
+    fn on_update(&mut self, _cx: &mut ScriptContext<'_>) {
         self.turns += 1;
     }
 }

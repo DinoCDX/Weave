@@ -8,10 +8,8 @@ struct Spinner {
     turns: f32,
 }
 
-impl Script for Spinner {
-    type Services = (Time,);
-
-    fn on_update(&mut self, cx: &mut ScriptContext<'_, Self::Services>) {
+impl Script<(Time,)> for Spinner {
+    fn on_update(&mut self, cx: &mut ScriptContext<'_, (Time,)>) {
         self.turns += cx.time().delta();
     }
 }
