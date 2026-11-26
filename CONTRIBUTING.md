@@ -2,25 +2,35 @@
 
 ## Before you open a change
 
-Run the same checks as CI:
+Run the checks CI runs:
+
+```
+scripts/check.sh          # Linux and macOS
+scripts/check.ps1         # Windows
+```
+
+Or run them one by one:
 
 ```
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo build --workspace
-cargo test --workspace
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo build --workspace --locked
+cargo test --workspace --locked
 ```
+
+Use `--locked` so the build matches `Cargo.lock`. If a dependency change is intended, update the lock file in the same change.
 
 ## Style rules
 
-- Formatting is `rustfmt` defaults. Clippy warnings are errors.
-- No comments in source, except `// SAFETY:` comments on `unsafe` blocks. Documentation goes in `docs/`.
+- Formatting is `rustfmt` defaults, with LF line endings (see `.gitattributes`). Clippy warnings are errors.
+- No comments in source, except `// SAFETY:` comments on `unsafe` blocks. Documentation goes in `docs/` or a crate README, and can be included in rustdoc with `#[doc = include_str!(...)]`.
 - Every `unsafe` block has a `// SAFETY:` comment that states the invariant it relies on.
 - Each crate has a README that states its boundary and its owner area.
-- Dependencies follow the rules in `docs/decisions.md` and the plan's dependency rule. `weave-heart` depends on no other project crate.
+- `weave-heart` depends on no other project crate. `weave-macros` depends on no project crate.
 
 ## Changes
 
 - Every merged change includes its tests.
-- Efficiency changes include before and after benchmark results on both reference tiers (see the plan, Section 9).
+- Public behaviour that scripts depend on gets a test that names the rule it checks.
+- Efficiency changes include before and after numbers on both reference tiers (see the plan, Section 9).
 - Decisions that change a recorded choice get an entry in `docs/decisions.md`.

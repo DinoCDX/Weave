@@ -109,9 +109,12 @@ impl<'a> SceneView<'a> {
         self.world.id(object)
     }
 
-    pub fn name(self, object: ObjectHandle) -> Option<&'a str> {
-        let world: &'a ObjectWorld = self.world;
-        world.name(object)
+    pub fn name(self, object: ObjectHandle) -> Option<String> {
+        self.world.name(object)
+    }
+
+    pub fn parent(self, object: ObjectHandle) -> Option<Option<ObjectHandle>> {
+        self.world.parent(object)
     }
 
     pub fn transform(self, object: ObjectHandle) -> Option<Transform> {

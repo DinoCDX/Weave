@@ -100,7 +100,7 @@ fn a_reused_slot_does_not_revive_a_stale_handle() {
     assert_ne!(old, new);
     assert!(!world.contains(old));
     assert_eq!(world.name(old), None);
-    assert_eq!(world.name(new), Some("second"));
+    assert_eq!(world.name(new).as_deref(), Some("second"));
     assert!(!world.despawn(old));
     assert!(world.contains(new));
 }

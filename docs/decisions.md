@@ -24,7 +24,7 @@ Consequences:
 | ID | Decision | Choice | Status |
 |---|---|---|---|
 | D-04 | Entity storage | `hecs` is now a dependency, pinned to `=0.11.2`. Entities are allocated and their `Transform` is stored in `hecs`. | Confirmed; in use from H1 |
-| D-18 | Name and parent location | Plan 5.10 says every object has `Name`, `Transform`, and `Parent` as components. H1 keeps `Name`, `Parent`, the children, and the sibling-name index in an index inside `ObjectWorld`, and keeps only `Transform` in `hecs`. Sibling uniqueness and stable paths are invariants of the tree, and they need lookups by name and by ID that archetype storage does not give. H2 revisits this when the derive macro defines the component schema. | Assumed; revisit in H2 |
+| D-18 (superseded by D-48) | Name and parent location | Plan 5.10 says every object has `Name`, `Transform`, and `Parent` as components. H1 keeps `Name`, `Parent`, the children, and the sibling-name index in an index inside `ObjectWorld`, and keeps only `Transform` in `hecs`. Sibling uniqueness and stable paths are invariants of the tree, and they need lookups by name and by ID that archetype storage does not give. H2 revisits this when the derive macro defines the component schema. | Assumed; revisit in H2 |
 | D-19 | Handle safety | `ObjectHandle` wraps `hecs::Entity`, so generations detect stale handles. Every public accessor returns `None`, `false`, or an error for a stale handle. Nothing panics on a stale handle. | Confirmed by H1 tests |
 | D-20 | Object IDs | `ObjectId` is a `u64`. Fresh IDs are issued above every ID seen, so explicit IDs from files never collide with fresh ones. IDs are not reused within a world. | Confirmed by H1 tests |
 
@@ -38,7 +38,7 @@ Consequences:
 | D-24 | Frame stages | Per frame: load, enable, ready, update, late update, disable, unload, as plan 5.7. Requests made before a tick take effect in that tick at their matching stage. Enable and disable therefore take effect at their stage, so an object disabled before a tick still runs its update for that frame. | Confirmed by H3 tests |
 | D-25 | Unload order | Children unload before parents, in postorder. Each enabled object gets on_disable before on_unload. Despawn unloads the subtree first, then removes it. | Confirmed by H3 tests |
 | D-26 | Deferred work | Structural changes and lifecycle requests go through `CommandBuffer` and are applied at the frame boundary. Spawn is deferred, so it returns no handle; use `Runtime::spawn` when the handle is needed immediately. Stale or invalid commands are skipped and returned in `FrameReport`. The caller decides whether to log them. | Confirmed by H3 tests |
-| D-27 | Component writes in stages | Components are read and written through `ObjectWorld` outside stages. Writes from inside a stage need a command, which H4 will add with scripts. | Open; H4 |
+| D-27 | Component writes in stages | Components are read and written through `ObjectWorld` outside stages. Writes from inside a stage need a command, which H4 will add with scripts. | Closed by D-52 |
 | D-28 | Listener | H3 defines the `Listener` trait that receives every stage. H4 replaces this with per-object scripts. | Assumed; revisit in H4 |
 
 ## Build verification
@@ -55,7 +55,7 @@ The project was built and tested with Rust 1.89.0 (`cargo build`, `cargo test`, 
 | D-32 | Script lifetime | Scripts keep their state across unload and reload. They are removed when their object is despawned. | Confirmed by H4 tests |
 | D-33 | Dispatch order | In a stage, objects run in stable ID order, and each object's scripts run in attach order. Scripts run before the `Listener` for the same event. | Confirmed by H4 tests |
 | D-34 | Script writes | A script changes the world only through `ScriptContext::commands`, which applies at the next boundary. | Confirmed by H4 tests |
-| D-35 | Attach and register API | `Runtime::attach`, `attach_modular`, and `register_script` are immediate calls made outside stages. Scripts cannot attach from inside a stage yet. | Open; revisit with H5 or L2 |
+| D-35 | Attach and register API | `Runtime::attach`, `attach_modular`, and `register_script` are immediate calls made outside stages. Scripts attach from inside a stage through `CommandBuffer::attach` and `attach_modular`, which apply at the next boundary. | Closed by D-52 |
 | D-36 | Services and failure | Services declared per script (plan 5.6) and the script-failure rule (plan 5.9) are not in H4. They belong to H5. | Open; H5 |
 
 ## Phase H5: service context and failure rule
@@ -95,3 +95,35 @@ The project was built and tested with Rust 1.89.0 (`cargo build`, `cargo test`, 
 - `Runtime::insert_component` lets components be added without exposing `ObjectWorld` mutably, which could bypass the runtime's invariants.
 - CI uses `--locked` on build, test, and clippy, so it cannot drift from `Cargo.lock`.
 - `.gitattributes` forces LF endings. Without it, the Windows checkout can produce CRLF and fail `cargo fmt --check`.
+
+## Heart completion pass
+
+| ID | Decision | Choice | Status |
+|---|---|---|---|
+| D-48 | Name and Transform as components | `Name` and `Transform` implement `Component`, so the schema can drive the inspector and serialisation (plan 5.10). Replaces D-18. | Confirmed by tests |
+| D-49 | Parent as a tree link | Each object stores its parent link inside the ECS entry, next to its name and transform. The link is structure, not a value: the scene file stores the tree by nesting (WeaveLoom, L phase), so `Parent` has no schema. | Confirmed; file form decided in L1 |
+| D-50 | Re-parenting | `Runtime::reparent` and `CommandBuffer::reparent` move an object and its subtree, keep its stable ID and loaded state, and refuse a sibling-name clash (`DuplicateName`), a cycle (`Cycle`), or a stale object or parent. Command failures are reported in `FrameReport::reparent_errors`. | Confirmed by tests |
+| D-51 | Logging skipped commands | In debug builds, every skipped command is written to stderr with its command name and handle, as plan 5.8 requires. Stale handles have no path to print, so the handle is shown. | Confirmed |
+| D-52 | Structural writes from stages | Scripts can insert, remove, and edit components, and attach or register-attach scripts, through `CommandBuffer`. These apply at the next boundary, and a rejected write is reported as `SkipReason::Rejected` or in `FrameReport::attach_errors`. Closes D-27 and D-35. | Confirmed by tests |
+| D-53 | Reserved components | `Name`, `Transform`, and the internal ID and parent components cannot be inserted, removed, or edited through the generic component API. Changing a name or the tree goes through `reparent`, and a transform goes through `set_transform`. This keeps the sibling-name index consistent. | Confirmed by tests |
+
+## Linux support and heart polish
+
+| ID | Decision | Choice | Status |
+|---|---|---|---|
+| D-54 | Linux support | Build, test, and clippy need only rustup, with no system libraries. The triangle needs a Vulkan driver, the loader, and a display (X11 or Wayland). Platform detection returns `Linux` on Linux, checked by a test. | Confirmed. The triangle ran for 6 seconds on Xvfb with Mesa's software Vulkan driver (lavapipe), and drew the expected gradient triangle. Screenshot in `docs/screenshots/linux-triangle.png`. Real GPU drivers not yet tested. |
+| D-55 | One-command checks | `scripts/check.sh` (Linux and macOS) and `scripts/check.ps1` (Windows) run format, clippy, build, and test with `--locked`. The same steps run in CI. | Confirmed; the script runs clean on Linux |
+| D-56 | Iteration order | `ObjectWorld` keeps its ID index sorted, so `objects()` yields objects in stable ID order, as the plan requires for every iteration that affects results. | Confirmed by test |
+| D-57 | Diagnostics | `Runtime::describe` prints the object tree with each object's state and script count. `Runtime::stats` returns object, loaded, active, script, and queued-command counts. `FrameReport::is_clean` and `issue_count` summarise a frame. | Confirmed by tests |
+| D-58 | Ease of use | `Runtime::update(dt)` runs a frame without a listener, and `NoListener` is exported for the same purpose. | Confirmed by test |
+| D-59 | Linux smoke test | `scripts/linux-smoke.sh` builds the triangle, runs it on a virtual X display, checks it is still alive after 6 seconds, and saves a screenshot. Needs `xvfb` and `imagemagick`. | Confirmed on Linux |
+
+## Derive macro
+
+| ID | Decision | Choice | Status |
+|---|---|---|---|
+| D-60 | Derive scope | `Component` covers named, tuple, and unit structs. Options: `name` on the struct, `rename` and `skip` on fields. Generics and enums are rejected with messages that point to `Field`. | Confirmed by tests and compile-fail examples |
+| D-61 | Field derive | `Field` covers unit-variant enums, stored as variant names, and single-field structs, stored as their field. Generics are rejected. | Confirmed by tests |
+| D-62 | Optional fields | `Option<T>` implements `Field`. A missing optional field loads as `None`, so files written before a field was added still load. A missing required field is still an error. | Confirmed by tests |
+| D-63 | Numeric types | `i32` and `u32` are stored as integers with range checks. `f64` has its own kind, so it keeps full precision. | Confirmed by tests |
+| D-64 | Syntax | `syn` is built with `clone-impls` in addition to `derive`, `parsing`, `printing`, and `proc-macro`. The lock file pins the version. | Confirmed by build |

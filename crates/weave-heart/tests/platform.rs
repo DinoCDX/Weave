@@ -134,3 +134,17 @@ fn the_override_component_round_trips_through_its_schema() {
     let borrowed: Vec<_> = values.iter().map(|(n, v)| (*n, v.clone())).collect();
     assert_eq!(PlatformOverride::from_values(&borrowed).unwrap(), original);
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_linux_build_reports_the_linux_platform() {
+    assert_eq!(PlatformKey::current(), Some(PlatformKey::Linux));
+    assert_eq!(Runtime::new().platform(), Some(PlatformKey::Linux));
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn a_windows_build_reports_the_windows_platform() {
+    assert_eq!(PlatformKey::current(), Some(PlatformKey::Windows));
+    assert_eq!(Runtime::new().platform(), Some(PlatformKey::Windows));
+}

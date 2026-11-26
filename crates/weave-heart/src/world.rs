@@ -1,8 +1,15 @@
+use std::any::TypeId;
 use std::collections::{BTreeMap, HashMap};
 
 use crate::component::Component;
-use crate::error::SpawnError;
-use crate::object::{ObjectHandle, ObjectId, Transform};
+use crate::error::{ReparentError, SpawnError};
+use crate::object::{Name, ObjectHandle, ObjectId, Transform};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct IdTag(ObjectId);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ParentLink(Option<ObjectHandle>);
 
 #[derive(Default)]
 struct Children {
@@ -22,17 +29,10 @@ impl Children {
     }
 }
 
-struct Record {
-    id: ObjectId,
-    name: Box<str>,
-    parent: Option<ObjectHandle>,
-    children: Children,
-}
-
 pub struct ObjectWorld {
     store: hecs::World,
-    records: HashMap<ObjectHandle, Record>,
-    by_id: HashMap<ObjectId, ObjectHandle>,
+    by_id: BTreeMap<ObjectId, ObjectHandle>,
+    children: HashMap<ObjectHandle, Children>,
     roots: Children,
     next_id: u64,
 }
@@ -47,19 +47,19 @@ impl ObjectWorld {
     pub fn new() -> Self {
         Self {
             store: hecs::World::new(),
-            records: HashMap::new(),
-            by_id: HashMap::new(),
+            by_id: BTreeMap::new(),
+            children: HashMap::new(),
             roots: Children::default(),
             next_id: 1,
         }
     }
 
     pub fn len(&self) -> usize {
-        self.records.len()
+        self.by_id.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.records.is_empty()
+        self.by_id.is_empty()
     }
 
     pub fn spawn(
@@ -85,47 +85,96 @@ impl ObjectWorld {
     }
 
     pub fn despawn(&mut self, handle: ObjectHandle) -> bool {
-        let Some(record) = self.records.get(&handle) else {
+        if !self.contains(handle) {
             return false;
-        };
-        let (parent, id, name) = (record.parent, record.id, record.name.clone());
+        }
+        let parent = self.parent_link(handle).unwrap_or(None);
+        let id = self.id_of(handle).expect("live objects have an id");
+        let name = self.name_of(handle).expect("live objects have a name");
         self.siblings_mut(parent).remove(id, &name);
 
         let mut stack = vec![handle];
         while let Some(current) = stack.pop() {
-            let Some(record) = self.records.remove(&current) else {
-                continue;
-            };
-            self.by_id.remove(&record.id);
-            stack.extend(record.children.by_id.values().copied());
+            if let Some(children) = self.children.remove(&current) {
+                stack.extend(children.by_id.values().copied());
+            }
+            if let Some(id) = self.id_of(current) {
+                self.by_id.remove(&id);
+            }
             let _ = self.store.despawn(current.0);
         }
         true
     }
 
+    pub fn reparent(
+        &mut self,
+        object: ObjectHandle,
+        parent: Option<ObjectHandle>,
+    ) -> Result<(), ReparentError> {
+        let Some(old_parent) = self.parent_link(object) else {
+            return Err(ReparentError::StaleObject(object));
+        };
+        if let Some(target) = parent {
+            if !self.contains(target) {
+                return Err(ReparentError::StaleParent(target));
+            }
+            if self.is_at_or_below(target, object) {
+                return Err(ReparentError::Cycle);
+            }
+        }
+        if old_parent == parent {
+            return Ok(());
+        }
+
+        let id = self.id_of(object).expect("live objects have an id");
+        let name = self.name_of(object).expect("live objects have a name");
+        if self
+            .siblings_checked(parent)
+            .by_name
+            .contains_key(name.as_str())
+        {
+            return Err(ReparentError::DuplicateName { parent, name });
+        }
+
+        self.siblings_mut(old_parent).remove(id, &name);
+        self.siblings_mut(parent)
+            .insert(id, name.into_boxed_str(), object);
+        if let Ok(mut link) = self.store.get::<&mut ParentLink>(object.0) {
+            link.0 = parent;
+        }
+        Ok(())
+    }
+
     pub fn contains(&self, handle: ObjectHandle) -> bool {
-        self.records.contains_key(&handle)
+        self.store.contains(handle.0)
     }
 
     pub fn id(&self, handle: ObjectHandle) -> Option<ObjectId> {
-        self.records.get(&handle).map(|record| record.id)
+        self.id_of(handle)
     }
 
     pub fn by_id(&self, id: ObjectId) -> Option<ObjectHandle> {
         self.by_id.get(&id).copied()
     }
 
-    pub fn name(&self, handle: ObjectHandle) -> Option<&str> {
-        self.records.get(&handle).map(|record| record.name.as_ref())
+    pub fn objects(&self) -> impl Iterator<Item = ObjectHandle> + '_ {
+        self.by_id.values().copied()
+    }
+
+    pub fn name(&self, handle: ObjectHandle) -> Option<String> {
+        self.name_of(handle)
+    }
+
+    pub fn parent(&self, handle: ObjectHandle) -> Option<Option<ObjectHandle>> {
+        self.parent_link(handle)
     }
 
     pub fn path(&self, handle: ObjectHandle) -> Option<String> {
         let mut segments = Vec::new();
         let mut current = Some(handle);
         while let Some(h) = current {
-            let record = self.records.get(&h)?;
-            segments.push(record.name.as_ref());
-            current = record.parent;
+            segments.push(self.name_of(h)?);
+            current = self.parent_link(h)?;
         }
         segments.reverse();
         Some(segments.join("/"))
@@ -135,7 +184,7 @@ impl ObjectWorld {
         let mut segments = path.split('/');
         let mut current = *self.roots.by_name.get(segments.next()?)?;
         for segment in segments {
-            current = *self.records.get(&current)?.children.by_name.get(segment)?;
+            current = *self.children.get(&current)?.by_name.get(segment)?;
         }
         Some(current)
     }
@@ -148,9 +197,9 @@ impl ObjectWorld {
         &self,
         handle: ObjectHandle,
     ) -> Option<impl Iterator<Item = ObjectHandle> + '_> {
-        self.records
+        self.children
             .get(&handle)
-            .map(|record| record.children.by_id.values().copied())
+            .map(|children| children.by_id.values().copied())
     }
 
     pub fn transform(&self, handle: ObjectHandle) -> Option<Transform> {
@@ -167,74 +216,10 @@ impl ObjectWorld {
         }
     }
 
-    fn insert(
-        &mut self,
-        id: ObjectId,
-        parent: Option<ObjectHandle>,
-        name: &str,
-    ) -> Result<ObjectHandle, SpawnError> {
-        validate_name(name)?;
-        if self.by_id.contains_key(&id) {
-            return Err(SpawnError::DuplicateId(id));
-        }
-        if self.siblings(parent)?.by_name.contains_key(name) {
-            return Err(SpawnError::DuplicateName {
-                parent,
-                name: name.to_owned(),
-            });
-        }
-
-        let handle = ObjectHandle(self.store.spawn((Transform::default(),)));
-        let name: Box<str> = name.into();
-        self.records.insert(
-            handle,
-            Record {
-                id,
-                name: name.clone(),
-                parent,
-                children: Children::default(),
-            },
-        );
-        self.by_id.insert(id, handle);
-        self.siblings_mut(parent).insert(id, name, handle);
-        Ok(handle)
-    }
-
-    fn siblings(&self, parent: Option<ObjectHandle>) -> Result<&Children, SpawnError> {
-        match parent {
-            None => Ok(&self.roots),
-            Some(p) => self
-                .records
-                .get(&p)
-                .map(|record| &record.children)
-                .ok_or(SpawnError::StaleParent(p)),
-        }
-    }
-
-    fn siblings_mut(&mut self, parent: Option<ObjectHandle>) -> &mut Children {
-        match parent {
-            None => &mut self.roots,
-            Some(p) => {
-                let record = self
-                    .records
-                    .get_mut(&p)
-                    .expect("parent is validated before it is used");
-                &mut record.children
-            }
-        }
-    }
-}
-
-fn validate_name(name: &str) -> Result<(), SpawnError> {
-    if name.is_empty() || name.contains('/') {
-        return Err(SpawnError::InvalidName(name.to_owned()));
-    }
-    Ok(())
-}
-
-impl ObjectWorld {
     pub fn insert_component<C: Component>(&mut self, object: ObjectHandle, component: C) -> bool {
-        self.contains(object) && self.store.insert_one(object.0, component).is_ok()
+        !is_reserved::<C>()
+            && self.contains(object)
+            && self.store.insert_one(object.0, component).is_ok()
     }
 
     pub fn has_component<C: Component>(&self, object: ObjectHandle) -> bool {
@@ -257,6 +242,9 @@ impl ObjectWorld {
         object: ObjectHandle,
         f: impl FnOnce(&mut C) -> R,
     ) -> Option<R> {
+        if is_reserved::<C>() {
+            return None;
+        }
         self.store
             .get::<&mut C>(object.0)
             .ok()
@@ -264,6 +252,111 @@ impl ObjectWorld {
     }
 
     pub fn remove_component<C: Component>(&mut self, object: ObjectHandle) -> Option<C> {
+        if is_reserved::<C>() {
+            return None;
+        }
         self.store.remove_one::<C>(object.0).ok()
     }
+
+    fn insert(
+        &mut self,
+        id: ObjectId,
+        parent: Option<ObjectHandle>,
+        name: &str,
+    ) -> Result<ObjectHandle, SpawnError> {
+        validate_name(name)?;
+        if self.by_id.contains_key(&id) {
+            return Err(SpawnError::DuplicateId(id));
+        }
+        if self.siblings(parent)?.by_name.contains_key(name) {
+            return Err(SpawnError::DuplicateName {
+                parent,
+                name: name.to_owned(),
+            });
+        }
+
+        let handle = ObjectHandle(self.store.spawn((
+            IdTag(id),
+            Name {
+                value: name.to_owned(),
+            },
+            ParentLink(parent),
+            Transform::default(),
+        )));
+        self.by_id.insert(id, handle);
+        self.children.insert(handle, Children::default());
+        self.siblings_mut(parent).insert(id, name.into(), handle);
+        Ok(handle)
+    }
+
+    fn id_of(&self, handle: ObjectHandle) -> Option<ObjectId> {
+        self.store.get::<&IdTag>(handle.0).ok().map(|tag| tag.0)
+    }
+
+    fn name_of(&self, handle: ObjectHandle) -> Option<String> {
+        self.store
+            .get::<&Name>(handle.0)
+            .ok()
+            .map(|name| name.value.clone())
+    }
+
+    fn parent_link(&self, handle: ObjectHandle) -> Option<Option<ObjectHandle>> {
+        self.store
+            .get::<&ParentLink>(handle.0)
+            .ok()
+            .map(|link| link.0)
+    }
+
+    fn is_at_or_below(&self, candidate: ObjectHandle, ancestor: ObjectHandle) -> bool {
+        let mut current = Some(candidate);
+        while let Some(h) = current {
+            if h == ancestor {
+                return true;
+            }
+            current = self.parent_link(h).flatten();
+        }
+        false
+    }
+
+    fn siblings(&self, parent: Option<ObjectHandle>) -> Result<&Children, SpawnError> {
+        match parent {
+            None => Ok(&self.roots),
+            Some(p) => self.children.get(&p).ok_or(SpawnError::StaleParent(p)),
+        }
+    }
+
+    fn siblings_checked(&self, parent: Option<ObjectHandle>) -> &Children {
+        match parent {
+            None => &self.roots,
+            Some(p) => self
+                .children
+                .get(&p)
+                .expect("parent is validated before it is used"),
+        }
+    }
+
+    fn siblings_mut(&mut self, parent: Option<ObjectHandle>) -> &mut Children {
+        match parent {
+            None => &mut self.roots,
+            Some(p) => self
+                .children
+                .get_mut(&p)
+                .expect("parent is validated before it is used"),
+        }
+    }
+}
+
+fn is_reserved<C: 'static>() -> bool {
+    let kind = TypeId::of::<C>();
+    kind == TypeId::of::<Name>()
+        || kind == TypeId::of::<Transform>()
+        || kind == TypeId::of::<IdTag>()
+        || kind == TypeId::of::<ParentLink>()
+}
+
+fn validate_name(name: &str) -> Result<(), SpawnError> {
+    if name.is_empty() || name.contains('/') {
+        return Err(SpawnError::InvalidName(name.to_owned()));
+    }
+    Ok(())
 }

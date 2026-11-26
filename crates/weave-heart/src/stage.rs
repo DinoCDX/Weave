@@ -39,6 +39,13 @@ pub trait Listener {
     fn on_stage(&mut self, stage: Stage, object: ObjectHandle, cx: &mut StageContext<'_>);
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NoListener;
+
+impl Listener for NoListener {
+    fn on_stage(&mut self, _stage: Stage, _object: ObjectHandle, _cx: &mut StageContext<'_>) {}
+}
+
 pub(crate) struct Env<'a> {
     pub(crate) world: &'a ObjectWorld,
     pub(crate) commands: &'a mut CommandBuffer,

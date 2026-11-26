@@ -10,6 +10,7 @@ pub enum FieldKind {
     Vec3 = 5,
     Vec4 = 6,
     TextList = 7,
+    Double = 8,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -20,6 +21,8 @@ pub enum Value {
     Text(String),
     Floats(Vec<f32>),
     TextList(Vec<String>),
+    Double(f64),
+    Nothing,
 }
 
 pub trait Field: Sized {
@@ -28,6 +31,77 @@ pub trait Field: Sized {
     fn to_value(&self) -> Value;
 
     fn from_value(value: &Value) -> Option<Self>;
+
+    fn absent() -> Option<Self> {
+        None
+    }
+}
+
+impl<T: Field> Field for Option<T> {
+    const KIND: FieldKind = T::KIND;
+
+    fn to_value(&self) -> Value {
+        match self {
+            Some(value) => value.to_value(),
+            None => Value::Nothing,
+        }
+    }
+
+    fn from_value(value: &Value) -> Option<Self> {
+        match value {
+            Value::Nothing => Some(None),
+            other => T::from_value(other).map(Some),
+        }
+    }
+
+    fn absent() -> Option<Self> {
+        Some(None)
+    }
+}
+
+impl Field for i32 {
+    const KIND: FieldKind = FieldKind::Int;
+
+    fn to_value(&self) -> Value {
+        Value::Int(i64::from(*self))
+    }
+
+    fn from_value(value: &Value) -> Option<Self> {
+        match value {
+            Value::Int(v) => i32::try_from(*v).ok(),
+            _ => None,
+        }
+    }
+}
+
+impl Field for u32 {
+    const KIND: FieldKind = FieldKind::Int;
+
+    fn to_value(&self) -> Value {
+        Value::Int(i64::from(*self))
+    }
+
+    fn from_value(value: &Value) -> Option<Self> {
+        match value {
+            Value::Int(v) => u32::try_from(*v).ok(),
+            _ => None,
+        }
+    }
+}
+
+impl Field for f64 {
+    const KIND: FieldKind = FieldKind::Double;
+
+    fn to_value(&self) -> Value {
+        Value::Double(*self)
+    }
+
+    fn from_value(value: &Value) -> Option<Self> {
+        match value {
+            Value::Double(v) => Some(*v),
+            _ => None,
+        }
+    }
 }
 
 impl Field for bool {
@@ -198,12 +272,14 @@ pub fn take_field<T: Field>(
     values: &[(&str, Value)],
     name: &'static str,
 ) -> Result<T, DecodeError> {
-    let value = values
+    let found = values
         .iter()
         .find(|(key, _)| *key == name)
-        .map(|(_, value)| value)
-        .ok_or(DecodeError::MissingField(name))?;
-    T::from_value(value).ok_or(DecodeError::WrongType(name))
+        .map(|(_, value)| value);
+    match found {
+        Some(value) => T::from_value(value).ok_or(DecodeError::WrongType(name)),
+        None => T::absent().ok_or(DecodeError::MissingField(name)),
+    }
 }
 
 impl Field for Vec<String> {
