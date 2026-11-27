@@ -1,7 +1,11 @@
 struct Instance {
-    model: mat4x4<f32>,
-    color: vec4<f32>,
-    material: vec4<f32>,
+    c0: vec4<f32>,
+    c1: vec4<f32>,
+    c2: vec4<f32>,
+    color: u32,
+    material: u32,
+    pad0: u32,
+    pad1: u32,
 }
 
 struct Params {
@@ -108,8 +112,8 @@ fn cull_main(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
     let instance = raw[index];
-    let center = instance.model[3].xyz;
-    let scale = max(length(instance.model[0].xyz), max(length(instance.model[1].xyz), length(instance.model[2].xyz)));
+    let center = vec3<f32>(instance.c0.w, instance.c1.w, instance.c2.w);
+    let scale = max(length(instance.c0.xyz), max(length(instance.c1.xyz), length(instance.c2.xyz)));
     let reach = params.radius * scale;
     if (!inside_frustum(center, reach)) {
         if (params.phase == 1u) {
@@ -118,13 +122,13 @@ fn cull_main(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
     let view_center = (camera.view * vec4<f32>(center, 1.0)).xyz;
-    if (params.phase != 0u && camera.screen.w > 0.5 && occluded(view_center, reach)) {
+    if ((params.phase == 1u || params.phase == 2u) && camera.screen.w > 0.5 && occluded(view_center, reach)) {
         if (params.phase == 1u) {
             flags[index] = 0u;
         }
         return;
     }
-    let lod = select_lod(screen_radius(view_center, reach));
+    let lod = select(select_lod(screen_radius(view_center, reach)), 0u, params.phase == 3u);
     let slot = atomicAdd(&args[lod * 5u + 1u], 1u);
     out[lod * params.capacity + params.first + slot] = instance;
     if (params.phase == 1u) {

@@ -9,6 +9,7 @@ use wgpu::util::DeviceExt;
 use crate::backend::Backend;
 use crate::camera::{Camera, FrameParams};
 use crate::cluster::{self, CLUSTER_COUNT, Clip, ClusterData, SLICES, TILES_X, TILES_Y};
+use crate::dynres::DynamicResolution;
 use crate::gpu_timer::GpuTimer;
 use crate::graph::{PassContext, RenderGraph, Timing, default_passes};
 use crate::lights::{Light, MAX_DIRECTIONAL, MAX_LIGHTS};
@@ -42,7 +43,7 @@ pub(crate) fn direct_source(clustered: &str) -> Result<String, String> {
     Ok(clustered.replace(CLUSTER_BLOCK, DIRECT_BLOCK))
 }
 const VERTEX_BYTES: u64 = 24;
-pub(crate) const INSTANCE_BYTES: u64 = 96;
+pub(crate) const INSTANCE_BYTES: u64 = 64;
 const CULL_PARAM_BYTES: u64 = 128;
 pub(crate) const MAX_LODS: usize = 4;
 pub(crate) const ARGS_BYTES: u64 = 20;
@@ -82,10 +83,13 @@ impl DrawInstance {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FrameStats {
+    pub render_scale: f32,
     pub submitted: usize,
     pub cull: Duration,
     pub lights: usize,
     pub lights_dropped: usize,
+    pub upload_bytes: usize,
+    pub shadow_reused: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -109,10 +113,13 @@ impl fmt::Display for RenderError {
 
 impl std::error::Error for RenderError {}
 
+#[allow(dead_code)]
 pub(crate) struct GpuLod {
     pub(crate) vertices: wgpu::Buffer,
     pub(crate) indices: wgpu::Buffer,
     pub(crate) index_count: u32,
+    pub(crate) clusters: wgpu::Buffer,
+    pub(crate) cluster_count: u32,
 }
 
 pub(crate) struct GpuMesh {
@@ -210,6 +217,13 @@ pub(crate) struct DrawResources {
     pub(crate) build_hzb: bool,
     pub(crate) occlusion_active: bool,
     pub(crate) hzb_ready: bool,
+    pub(crate) uploaded: Vec<u8>,
+    pub(crate) upload_bytes: usize,
+    pub(crate) instances_dirty: bool,
+    pub(crate) layout_changed: bool,
+    pub(crate) shadow_reuse: bool,
+    pub(crate) shadow_valid: bool,
+    pub(crate) shadow_matrix: [f32; 16],
 }
 
 pub struct Renderer {
@@ -229,6 +243,178 @@ pub struct Renderer {
     clusters: ClusterData,
     light_path: LightPath,
     shadows: bool,
+    target: (u32, u32),
+    scene: Option<wgpu::TextureView>,
+    upscaler: Upscaler,
+    dynres: Option<DynamicResolution>,
+    scale: f32,
+    last_frame: Option<Instant>,
+    frame_index: u64,
+    scale_changed_at: u64,
+}
+
+pub(crate) struct Upscaler {
+    pipeline: wgpu::RenderPipeline,
+    layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+    bind: Option<wgpu::BindGroup>,
+}
+
+impl Upscaler {
+    fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("upscale"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("upscale"),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("upscale"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/upscale.wgsl").into()),
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("upscale"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &module,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("upscale"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+        Self {
+            pipeline,
+            layout,
+            sampler,
+            bind: None,
+        }
+    }
+
+    fn make_bind(&self, device: &wgpu::Device, scene: &wgpu::TextureView) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("upscale"),
+            layout: &self.layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(scene),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+        })
+    }
+
+    fn record(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        timing: Option<(&wgpu::QuerySet, u32)>,
+    ) {
+        let Some(bind) = self.bind.as_ref() else {
+            return;
+        };
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("upscale"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: timing.map(|(set, index)| wgpu::RenderPassTimestampWrites {
+                query_set: set,
+                beginning_of_pass_write_index: Some(index),
+                end_of_pass_write_index: Some(index + 1),
+            }),
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, bind, &[]);
+        pass.draw(0..3, 0..1);
+    }
+}
+
+fn internal_size(width: u32, height: u32, scale: f32) -> (u32, u32) {
+    (
+        (width as f32 * scale).round().max(1.0) as u32,
+        (height as f32 * scale).round().max(1.0) as u32,
+    )
+}
+
+fn create_scene(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+    size: (u32, u32),
+) -> wgpu::TextureView {
+    device
+        .create_texture(&wgpu::TextureDescriptor {
+            label: Some("scene color"),
+            size: wgpu::Extent3d {
+                width: size.0,
+                height: size.1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        })
+        .create_view(&wgpu::TextureViewDescriptor::default())
 }
 
 impl Renderer {
@@ -283,6 +469,8 @@ impl Renderer {
             .ok_or(RenderError::SurfaceUnsupported)?;
         surface.configure(&device, &config);
 
+        let target = (config.width, config.height);
+        let upscaler = Upscaler::new(&device, config.format);
         let depth = create_depth(&device, config.width, config.height);
         let (draws, shader) =
             DrawResources::new(&device, config.format, config.width, config.height, &depth);
@@ -307,6 +495,14 @@ impl Renderer {
             clusters: ClusterData::default(),
             light_path: LightPath::Auto,
             shadows: true,
+            target,
+            scene: None,
+            upscaler,
+            dynres: None,
+            scale: 1.0,
+            last_frame: None,
+            frame_index: 0,
+            scale_changed_at: 0,
         })
     }
 
@@ -317,17 +513,44 @@ impl Renderer {
         self.config.width = width;
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
-        self.depth = create_depth(&self.device, width, height);
+        self.target = (0, 0);
+        self.ensure_targets();
+    }
+
+    pub fn set_dynamic_resolution(&mut self, config: Option<DynamicResolution>) {
+        self.scale = config.map_or(1.0, |controller| controller.scale());
+        self.dynres = config;
+        self.last_frame = None;
+    }
+
+    pub fn render_scale(&self) -> f32 {
+        self.scale
+    }
+
+    fn ensure_targets(&mut self) {
+        let size = internal_size(self.config.width, self.config.height, self.scale);
+        if size == self.target {
+            return;
+        }
+        self.target = size;
+        self.depth = create_depth(&self.device, size.0, size.1);
         self.draws.hzb = create_hzb(
             &self.device,
-            width,
-            height,
+            size.0,
+            size.1,
             &self.depth,
             &self.draws.hzb_l0_layout,
             &self.draws.hzb_down_layout,
         );
         self.draws.hzb_ready = false;
         self.draws.binds_valid = false;
+        self.scene = (size != (self.config.width, self.config.height))
+            .then(|| create_scene(&self.device, self.config.format, size));
+        let bind = self
+            .scene
+            .as_ref()
+            .map(|view| self.upscaler.make_bind(&self.device, view));
+        self.upscaler.bind = bind;
     }
 
     pub fn visible_counts(&self) -> Vec<u32> {
@@ -392,6 +615,7 @@ impl Renderer {
 
     pub fn set_shadows(&mut self, enabled: bool) {
         self.shadows = enabled;
+        self.draws.shadow_valid = false;
     }
 
     pub fn set_light_path(&mut self, path: LightPath) {
@@ -495,6 +719,28 @@ impl Renderer {
         params: &FrameParams,
         batches: &[Batch<'_>],
     ) -> Result<FrameStats, RenderError> {
+        let now = Instant::now();
+        let previous = self.last_frame.replace(now);
+        let gpu_frame = self.graph.take_gpu_frame();
+        self.frame_index += 1;
+        if let Some(controller) = self.dynres.as_mut() {
+            let sample = if self.gpu_timer.is_some() {
+                gpu_frame
+            } else {
+                previous.map(|earlier| now - earlier)
+            };
+            let settled = self.gpu_timer.is_none()
+                || self.frame_index - self.scale_changed_at > crate::gpu_timer::RING as u64 + 1;
+            if let Some(frame) = sample.filter(|_| settled) {
+                let before = self.scale;
+                self.scale = controller.observe(frame);
+                if self.scale != before {
+                    self.scale_changed_at = self.frame_index;
+                }
+            }
+        }
+        self.ensure_targets();
+        let scale_now = self.scale;
         let submitted: usize = batches.iter().map(|batch| batch.instances.len()).sum();
         let total_lights = lights.len().min(MAX_LIGHTS + MAX_DIRECTIONAL);
         let dropped_before_upload = lights.len().saturating_sub(total_lights);
@@ -503,6 +749,9 @@ impl Renderer {
             cull,
             lights: total_lights,
             lights_dropped: dropped_before_upload,
+            upload_bytes: 0,
+            shadow_reused: false,
+            render_scale: scale_now,
         };
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame)
@@ -517,7 +766,7 @@ impl Renderer {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
-        let aspect = self.config.width as f32 / self.config.height as f32;
+        let aspect = self.target.0 as f32 / self.target.1 as f32;
         let view_proj = camera.view_proj(aspect);
         let mut directional = [Light::default(); MAX_DIRECTIONAL];
         let (directional_count, light_dropped) =
@@ -555,8 +804,8 @@ impl Renderer {
         push_floats(
             &mut self.scratch,
             &[
-                self.config.width as f32,
-                self.config.height as f32,
+                self.target.0 as f32,
+                self.target.1 as f32,
                 directional_count as f32,
                 self.storage_lights.len() as f32,
             ],
@@ -601,8 +850,8 @@ impl Renderer {
         let camera_planes = self.plane_set(view_proj);
         let shadow_planes = shadows_enabled.then(|| self.plane_set(shadow_view_proj));
         let camera_screen = [
-            self.config.width as f32,
-            self.config.height as f32,
+            self.target.0 as f32,
+            self.target.1 as f32,
             self.draws.hzb.levels as f32,
             if self.draws.occlusion_active {
                 1.0
@@ -619,7 +868,10 @@ impl Renderer {
         );
         self.queue
             .write_buffer(&self.draws.camera_ubo, 0, &camera_data);
-        self.upload_batches(batches, camera_planes, shadow_planes);
+        let shadow_candidate = shadows_enabled
+            && self.draws.shadow_valid
+            && self.draws.shadow_matrix == shadow_view_proj.to_cols_array();
+        self.upload_batches(batches, camera_planes, shadow_planes, shadow_candidate);
         let cull = cull_start.elapsed();
 
         let mut encoder = self
@@ -639,7 +891,7 @@ impl Renderer {
         {
             let mut cx = PassContext {
                 encoder: &mut encoder,
-                color: &view,
+                color: self.scene.as_ref().unwrap_or(&view),
                 depth: &self.depth,
                 draws: &self.draws,
                 timestamps,
@@ -647,10 +899,25 @@ impl Renderer {
             };
             self.graph.execute(&mut cx);
         }
+        let blit_timed = self.scene.is_some() && timing_frame;
+        let blit_index = u32::try_from(self.graph.slot_count() * 2).unwrap_or(0);
+        self.upscaler.record(
+            &mut encoder,
+            &view,
+            timestamps
+                .filter(|_| blit_timed)
+                .map(|set| (set, blit_index)),
+        );
         if timing_frame && let Some(timer) = self.gpu_timer.as_mut() {
-            timer.finish_frame(&mut encoder);
+            timer.finish_frame(&mut encoder, blit_timed);
         }
         self.queue.submit(Some(encoder.finish()));
+        if !shadows_enabled {
+            self.draws.shadow_valid = false;
+        } else if !self.draws.shadow_reuse {
+            self.draws.shadow_valid = true;
+            self.draws.shadow_matrix = shadow_view_proj.to_cols_array();
+        }
         self.draws.hzb_ready = self.culling;
         if timing_frame && let Some(timer) = self.gpu_timer.as_mut() {
             timer.map_after_submit();
@@ -661,6 +928,9 @@ impl Renderer {
             cull,
             lights: light_total,
             lights_dropped: light_dropped,
+            upload_bytes: self.draws.upload_bytes,
+            shadow_reused: self.draws.shadow_reuse,
+            render_scale: self.scale,
         })
     }
 
@@ -751,10 +1021,11 @@ impl Renderer {
         batches: &[Batch<'_>],
         camera: [[f32; 4]; 6],
         shadow: Option<[[f32; 4]; 6]>,
+        shadow_candidate: bool,
     ) {
         let total: usize = batches.iter().map(|batch| batch.instances.len()).sum();
         self.scratch.clear();
-        self.draws.batches.clear();
+        let previous_batches = std::mem::take(&mut self.draws.batches);
         self.draws.groups.clear();
         let mut first = 0usize;
         for batch in batches {
@@ -770,7 +1041,9 @@ impl Renderer {
             self.draws.groups.push(count.div_ceil(WORKGROUP_SIZE));
             first += batch.instances.len();
         }
-        if total > self.draws.capacity {
+        self.draws.layout_changed = previous_batches != self.draws.batches;
+        let reallocated = total > self.draws.capacity;
+        if reallocated {
             self.draws.capacity = total.max(1).next_power_of_two();
             self.draws.raw_instances = create_instance_buffer(&self.device, self.draws.capacity);
             self.draws.camera_compact =
@@ -782,11 +1055,19 @@ impl Renderer {
             self.draws.flags =
                 create_storage(&self.device, self.draws.capacity as u64 * 4, "flags");
             self.draws.binds_valid = false;
+            self.draws.uploaded.clear();
         }
-        if !self.scratch.is_empty() {
-            self.queue
-                .write_buffer(&self.draws.raw_instances, 0, &self.scratch);
-        }
+        let (upload_bytes, instances_dirty) = sync_instances(
+            &self.queue,
+            &self.draws.raw_instances,
+            &mut self.draws.uploaded,
+            &self.scratch,
+        );
+        self.draws.upload_bytes = upload_bytes;
+        self.draws.instances_dirty = instances_dirty;
+        let reuse =
+            shadow_candidate && !instances_dirty && !self.draws.layout_changed && !reallocated;
+        self.draws.shadow_reuse = reuse;
         while self.draws.slots.len() < batches.len() {
             self.draws.slots.push(BatchSlot::new(&self.device));
         }
@@ -817,12 +1098,13 @@ impl Renderer {
                     first,
                     count,
                     lod_count,
-                    0,
+                    3,
                     capacity,
                     radius,
                 ),
             );
-            for args_buffer in &slot.args {
+            let written = if reuse { 2 } else { 3 };
+            for args_buffer in &slot.args[..written] {
                 self.queue.write_buffer(args_buffer, 0, &args);
             }
         }
@@ -877,9 +1159,70 @@ impl Renderer {
 }
 
 fn push_instance(out: &mut Vec<u8>, instance: &DrawInstance) {
-    push_floats(out, &instance.model.to_cols_array());
-    push_floats(out, &instance.color);
-    push_floats(out, &instance.material);
+    let m = instance.model.to_cols_array();
+    push_floats(
+        out,
+        &[
+            m[0], m[1], m[2], m[12], m[4], m[5], m[6], m[13], m[8], m[9], m[10], m[14],
+        ],
+    );
+    out.extend_from_slice(&pack_unorm8(instance.color));
+    out.extend_from_slice(&pack_unorm8([
+        instance.material[0],
+        instance.material[1],
+        0.0,
+        0.0,
+    ]));
+    out.extend_from_slice(&[0u8; 8]);
+}
+
+fn pack_unorm8(values: [f32; 4]) -> [u8; 4] {
+    values.map(|value| (value.clamp(0.0, 1.0) * 255.0).round() as u8)
+}
+
+fn dirty_runs(bytes: &[u8], uploaded: &[u8]) -> Vec<std::ops::Range<usize>> {
+    let stride = INSTANCE_BYTES as usize;
+    let count = bytes.len() / stride;
+    let mut runs = Vec::new();
+    let mut start: Option<usize> = None;
+    for index in 0..=count {
+        let differs = index < count && {
+            let range = index * stride..(index + 1) * stride;
+            bytes[range.clone()] != uploaded[range]
+        };
+        match (differs, start) {
+            (true, None) => start = Some(index),
+            (false, Some(first)) => {
+                runs.push(first * stride..index * stride);
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    runs
+}
+
+fn sync_instances(
+    queue: &wgpu::Queue,
+    buffer: &wgpu::Buffer,
+    uploaded: &mut Vec<u8>,
+    bytes: &[u8],
+) -> (usize, bool) {
+    if uploaded.len() != bytes.len() {
+        uploaded.clear();
+        uploaded.extend_from_slice(bytes);
+        if !bytes.is_empty() {
+            queue.write_buffer(buffer, 0, bytes);
+        }
+        return (bytes.len(), !bytes.is_empty());
+    }
+    let mut written = 0;
+    for range in dirty_runs(bytes, uploaded) {
+        queue.write_buffer(buffer, range.start as u64, &bytes[range.clone()]);
+        uploaded[range.clone()].copy_from_slice(&bytes[range.clone()]);
+        written += range.len();
+    }
+    (written, written > 0)
 }
 
 fn cull_params_bytes(
@@ -1560,6 +1903,13 @@ impl DrawResources {
             build_hzb: false,
             occlusion_active: false,
             hzb_ready: false,
+            uploaded: Vec::new(),
+            upload_bytes: 0,
+            instances_dirty: false,
+            layout_changed: true,
+            shadow_reuse: false,
+            shadow_valid: false,
+            shadow_matrix: [0.0; 16],
         };
         (draws, shader)
     }
@@ -1629,7 +1979,7 @@ const VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 2] = [
         shader_location: 1,
     },
 ];
-const INSTANCE_ATTRIBUTES: [wgpu::VertexAttribute; 6] = [
+const INSTANCE_ATTRIBUTES: [wgpu::VertexAttribute; 5] = [
     wgpu::VertexAttribute {
         format: wgpu::VertexFormat::Float32x4,
         offset: 0,
@@ -1646,18 +1996,13 @@ const INSTANCE_ATTRIBUTES: [wgpu::VertexAttribute; 6] = [
         shader_location: 5,
     },
     wgpu::VertexAttribute {
-        format: wgpu::VertexFormat::Float32x4,
+        format: wgpu::VertexFormat::Unorm8x4,
         offset: 48,
-        shader_location: 6,
-    },
-    wgpu::VertexAttribute {
-        format: wgpu::VertexFormat::Float32x4,
-        offset: 64,
         shader_location: 7,
     },
     wgpu::VertexAttribute {
-        format: wgpu::VertexFormat::Float32x4,
-        offset: 80,
+        format: wgpu::VertexFormat::Unorm8x4,
+        offset: 52,
         shader_location: 8,
     },
 ];
@@ -1777,10 +2122,18 @@ fn upload_lod(device: &wgpu::Device, mesh: &Mesh) -> GpuLod {
         contents: &index_bytes,
         usage: wgpu::BufferUsages::INDEX,
     });
+    let clusters_list = crate::meshlet::build_clusters(mesh, crate::meshlet::CLUSTER_TRIANGLES);
+    let clusters = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("mesh clusters"),
+        contents: &crate::meshlet::cluster_bytes(&clusters_list),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
     GpuLod {
         vertices,
         indices,
         index_count: u32::try_from(mesh.indices.len()).unwrap_or(u32::MAX),
+        clusters,
+        cluster_count: u32::try_from(clusters_list.len()).unwrap_or(u32::MAX),
     }
 }
 
@@ -1980,6 +2333,73 @@ mod tests {
             lod_args_bytes([36u32].into_iter()).len() as u64,
             ARGS_BYTES * MAX_LODS as u64
         );
+    }
+}
+
+#[cfg(test)]
+mod upload_tests {
+    use super::*;
+
+    fn record(value: u8) -> Vec<u8> {
+        vec![value; INSTANCE_BYTES as usize]
+    }
+
+    fn join(records: &[Vec<u8>]) -> Vec<u8> {
+        records.concat()
+    }
+
+    #[test]
+    fn identical_instances_upload_nothing() {
+        let bytes = join(&[record(1), record(2), record(3)]);
+        assert!(dirty_runs(&bytes, &bytes).is_empty());
+    }
+
+    #[test]
+    fn one_changed_instance_is_one_run() {
+        let before = join(&[record(1), record(2), record(3)]);
+        let after = join(&[record(1), record(9), record(3)]);
+        let stride = INSTANCE_BYTES as usize;
+        assert_eq!(dirty_runs(&after, &before), vec![stride..2 * stride]);
+    }
+
+    #[test]
+    fn adjacent_changes_merge_and_separate_ones_split() {
+        let stride = INSTANCE_BYTES as usize;
+        let before = join(&[record(1), record(2), record(3), record(4)]);
+        let after = join(&[record(9), record(9), record(3), record(9)]);
+        assert_eq!(
+            dirty_runs(&after, &before),
+            vec![0..2 * stride, 3 * stride..4 * stride]
+        );
+    }
+
+    #[test]
+    fn a_change_in_the_last_instance_closes_the_run() {
+        let stride = INSTANCE_BYTES as usize;
+        let before = join(&[record(1), record(2)]);
+        let after = join(&[record(1), record(9)]);
+        assert_eq!(dirty_runs(&after, &before), vec![stride..2 * stride]);
+    }
+
+    #[test]
+    fn packed_records_match_the_gpu_layout() {
+        let instance = DrawInstance::new(
+            Mat4::from_translation(Vec3::new(1.0, 2.0, 3.0)),
+            [1.0, 0.0, 0.5, 2.0],
+        )
+        .with_material(0.25, 1.0);
+        let mut bytes = Vec::new();
+        push_instance(&mut bytes, &instance);
+        assert_eq!(bytes.len() as u64, INSTANCE_BYTES);
+        let floats: Vec<f32> = bytes[..48]
+            .chunks(4)
+            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect();
+        assert_eq!(floats[3], 1.0);
+        assert_eq!(floats[7], 2.0);
+        assert_eq!(floats[11], 3.0);
+        assert_eq!(&bytes[48..52], &[255, 0, 128, 255]);
+        assert_eq!(&bytes[52..54], &[64, 255]);
     }
 }
 

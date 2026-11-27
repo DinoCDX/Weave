@@ -369,3 +369,104 @@ What it does not show:
 - Temporal behaviour when the camera moves. The two-phase design should draw newly visible objects in phase two, but a moving camera was not captured, so popping is not ruled out.
 
 Compared with: B-017, same flags with the wall added. The no-wall dense rows match B-017's new-renderer rows within run-to-run spread.
+
+## B-019: instance record 96 to 64 bytes, delta upload, shadow map cache (lavapipe)
+
+Code state: `renderer.rs` with the 64-byte instance record (D-R12), delta upload of instance data, and the shadow map cache with finest-LOD shadow casters (D-R11). Compared with the code before these changes, which is the tree at B-018.
+
+Environment: this session. 1 vCPU, 3 GB RAM, Ubuntu 24.04, rustc and cargo 1.89.0, wgpu 30.0.2, Mesa lavapipe (CPU Vulkan) under Xvfb. No GPU. The host is shared, so repeated runs vary.
+
+Dense scene, cull on, sync on: `render-bench --scenario dense --count 10000 --mode batched --cull on --sync on --frames 200 --size 1920x1080`, two runs each.
+
+| build | frame (µs) | upload per frame | shadow reused |
+|---|---:|---:|---|
+| before | 197,613 and 196,650 | 960,000 B (10,000 × 96, computed) | not applicable |
+| after | 168,647 and 167,814 | 0 B | 170 of 170 |
+
+Dense scene, cull off, sync on: same command with `--cull off --frames 150`, two runs each.
+
+| build | frame (µs) | shadow reused |
+|---|---:|---|
+| before | 174,582 and 172,758 | not applicable |
+| after | 140,298 and 140,902 | 120 of 120 |
+
+Drawn counts are unchanged (5,827 with culling, 10,000 without), so visibility did not change.
+
+Image check: `showcase --size 1024x640 --still on --shadows on --occlusion on`, captured from the X root window. Of 655,360 pixels, 755 differ by at least 2 levels, 143 by more than 4, 12 by more than 20, and the maximum is 37. Most single-level differences come from 8-bit color packing. The larger differences cluster in rows 400 to 480, around the sphere's shadow edge, and come from the shadow LOD now being fixed at the finest level.
+
+What it shows:
+- Static scenes stop uploading instance data and stop re-rendering the shadow map. The frame saving in this software-rasterized setup is about 15 percent with culling and about 19 percent without.
+- The instance record is one third smaller, and output is unchanged except for the small shadow-edge difference above.
+
+What it does not show:
+- Anything about a real GPU. Lavapipe rasterizes on the CPU, so the saving in shadow and raster work is exaggerated relative to hardware where those passes are cheap.
+- Cost when the scene changes every frame. The changed-run path was tested only by unit tests (`upload_tests`), not timed. The fallback path compares about 640 KB per frame on the CPU.
+- Moving lights or moving casters with the cache in use. The cache is invalidated by any change in light matrix, caster bytes, or batch layout, but a moving-scene capture was not run.
+- Multi-level meshes, where forcing the finest shadow LOD costs extra triangles in the shadow pass. The benchmark meshes are single-level.
+
+Compared with: B-018 (same command and machine) for the frame times. The before rows are the original tree, rebuilt from the same source.
+
+## B-020: dynamic resolution, frame-time controller and upscale pass (lavapipe)
+
+Code state: `weave-eye` with the dynamic resolution controller (`dynres.rs`, D-R13), the scene rendered to an internal target and upscaled to the swapchain by a bilinear pass, and depth and HZB sized to the internal target. Compared with the code at B-019.
+
+Environment: as B-019. 1 vCPU, Mesa lavapipe under Xvfb, rustc 1.89.0, no GPU.
+
+Command: `render-bench --scenario dense --count 10000 --mode batched --cull on --sync on --size 1920x1080`, with the dynamic resolution flags shown.
+
+| setting | frame (µs) | render scale (average) |
+|---|---:|---:|
+| `--dynres off`, 120 frames | 167,471 | 1.00 |
+| `--dynres on --budget-ms 400`, 120 frames | not recorded | 1.00 |
+| `--dynres on --budget-ms 150 --min-scale 0.5`, 200 frames | 113,425 | 0.54 |
+| `--dynres on --budget-ms 100 --min-scale 0.5`, 200 frames | not recorded | 0.50 |
+
+The average scale for the 150 ms budget includes the first frames, which run at full scale before the controller reacts.
+
+Image check: a 1920×1080 root-window capture during a scaled run (budget 100 ms, scale held at 0.5) and during a full-resolution run. Mean brightness 99.5 against 98.2, and the scaled frame has no black regions. This is a sanity check, not a pixel comparison; the scaled image was not compared pixel by pixel.
+
+Controller tests (6 unit tests in `dynres.rs`): full scale when under budget, immediate drop on one heavy frame, never below the minimum, settling near the budget with no oscillation, recovery to full scale when load drops, and every scale value on the 0.05 grid.
+
+What it shows:
+- The controller works end to end. It holds full scale when the budget is loose, drops to the minimum when the budget is unreachable, and settles between the two.
+- The scaled path runs without validation errors and produces a visible image.
+
+What it does not show:
+- Frame time against scale on real hardware. On lavapipe, the cube work (culling, vertex, and fixed per-frame costs) does not shrink with pixel count, so frame time falls far less than scale squared. At scale 0.5 the frame still takes about 110 ms. On a GPU where the cost is mostly per-pixel, the reduction should be larger.
+- Quality of the bilinear upscale against native resolution. No sharpening or temporal filter is in place yet.
+- Behaviour with GPU timestamps. The controller uses frame interval, which matches GPU time only when the benchmark waits for the GPU (`--sync on`) or presentation is blocking.
+- Behaviour on window resize while scaled. The targets are rebuilt on resize, but no test exercises that path.
+
+## B-021: GPU-timestamp controller, sharpened upscale, and blit cost (lavapipe)
+
+Code state: the controller takes GPU frame time from timestamps (the sum of the timed passes from the first timed point to the last, including the upscale pass), and it ignores samples until they reflect the current scale (RING + 1 frames after a change). The upscale pass uses a contrast-adaptive sharpening filter (AMD CAS-style, five taps). Compared with B-020, which used frame interval.
+
+Environment: as B-019 and B-020.
+
+Edge energy, same scaled scene (budget 100 ms, scale held at 0.5). The Laplacian mean of the captured frame, as a sharpness measure:
+
+| output | edge energy | mean luma |
+|---|---:|---:|
+| full resolution (B-020 capture) | 17.7 | 99.1 |
+| scaled, bilinear only (B-020 capture) | 6.1 | 100.4 |
+| scaled, with sharpening | 9.8 | 99.5 |
+
+Blit cost, pinned at scale 0.5 (`--dynres on --budget-ms 1 --min-scale 0.5 --frames 120`, the controller stays at the minimum):
+
+| upscale filter | frame (µs) | gpu opaque (µs) |
+|---|---:|---:|
+| sharpening | 177,788 | 56,671 |
+| bilinear only | 117,052 | 53,286 |
+
+Controller, GPU timestamps: `--dynres on --budget-ms 150 --min-scale 0.5 --frames 240` gives frame 175,820 µs at scale 0.50, and `--budget-ms 400 --frames 120` gives frame 189,364 µs at scale 1.00.
+
+What it shows:
+- The sharpening filter raises edge energy about 60 percent over bilinear at the same scale, and recovers part of the gap to full resolution.
+- On lavapipe the sharpen pass adds about 60 ms per frame at 1080p. The controller is correct to count it, because it is part of the GPU work.
+- The GPU-timestamp controller now follows GPU work, and it no longer reacts to stale samples.
+
+What it does not show:
+- A real GPU cost. Lavapipe runs fragment shaders on the CPU, so the 60 ms is far larger than a five-tap filter over 2 million pixels would cost on a GPU. This needs a measurement on hardware.
+- Why the GPU-timestamp controller drops to the minimum at a 150 ms budget, while the interval controller held about 113 ms in B-020. The pass sum at the minimum scale stays above the 85 percent raise threshold, so the controller correctly keeps the scale low. The difference from B-020 comes mostly from the sharpen cost, which the interval controller saw too but which was smaller in that run. This was not separated further.
+- The cull compute pass is not timed (it has no timestamp writes), so its cost is excluded from the controller input.
+- CPU-side cost. The controller watches GPU time only, so a CPU-bound frame does not lower the scale.

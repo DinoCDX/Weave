@@ -15,11 +15,12 @@ pub(crate) struct GpuTimer {
     passes: usize,
     frame: usize,
     active: Option<usize>,
+    blit_used: [bool; RING],
 }
 
 impl GpuTimer {
     pub(crate) fn new(device: &wgpu::Device, queue: &wgpu::Queue, passes: usize) -> Self {
-        let count = u32::try_from(passes * 2).unwrap_or(u32::MAX);
+        let count = u32::try_from(passes * 2 + 2).unwrap_or(u32::MAX);
         let bytes = u64::from(count) * 8;
         let set = device.create_query_set(&wgpu::QuerySetDescriptor {
             label: Some("pass timestamps"),
@@ -49,6 +50,7 @@ impl GpuTimer {
             passes,
             frame: 0,
             active: None,
+            blit_used: [false; RING],
         }
     }
 
@@ -77,11 +79,12 @@ impl GpuTimer {
         true
     }
 
-    pub(crate) fn finish_frame(&mut self, encoder: &mut wgpu::CommandEncoder) {
+    pub(crate) fn finish_frame(&mut self, encoder: &mut wgpu::CommandEncoder, blit: bool) {
         let Some(slot) = self.active else {
             return;
         };
-        let count = u32::try_from(self.passes * 2).unwrap_or(u32::MAX);
+        self.blit_used[slot] = blit;
+        let count = u32::try_from(self.passes * 2 + 2).unwrap_or(u32::MAX);
         encoder.resolve_query_set(&self.set, 0..count, &self.resolve, 0);
         encoder.copy_buffer_to_buffer(
             &self.resolve,
@@ -112,13 +115,31 @@ impl GpuTimer {
         let buffer = &self.readback[slot];
         if let Ok(view) = buffer.slice(..).get_mapped_range() {
             let data: &[u8] = &view;
+            let mut first = u64::MAX;
+            let mut last = 0u64;
             for pass in 0..self.passes {
                 let begin = u64_at(data, pass * 16);
                 let end = u64_at(data, pass * 16 + 8);
                 if end >= begin {
                     let nanos = (end - begin) as f64 * self.period_ns;
                     graph.record_gpu(pass, Duration::from_nanos(nanos as u64));
+                    if end > 0 {
+                        first = first.min(begin);
+                        last = last.max(end);
+                    }
                 }
+            }
+            if self.blit_used[slot] {
+                let begin = u64_at(data, self.passes * 16);
+                let end = u64_at(data, self.passes * 16 + 8);
+                if end >= begin && end > 0 {
+                    first = first.min(begin);
+                    last = last.max(end);
+                }
+            }
+            if last > first {
+                let nanos = (last - first) as f64 * self.period_ns;
+                graph.record_gpu_frame(Duration::from_nanos(nanos as u64));
             }
         }
         buffer.unmap();

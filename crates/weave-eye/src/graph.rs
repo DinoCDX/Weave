@@ -85,6 +85,7 @@ struct Slot {
 
 pub struct RenderGraph {
     slots: Vec<Slot>,
+    gpu_frame: Option<Duration>,
 }
 
 impl RenderGraph {
@@ -112,6 +113,7 @@ impl RenderGraph {
             }
         }
         Ok(Self {
+            gpu_frame: None,
             slots: passes
                 .into_iter()
                 .map(|pass| Slot {
@@ -139,6 +141,14 @@ impl RenderGraph {
             .iter()
             .find(|slot| slot.pass.name() == name)
             .map(|slot| slot.gpu)
+    }
+
+    pub(crate) fn record_gpu_frame(&mut self, elapsed: Duration) {
+        self.gpu_frame = Some(elapsed);
+    }
+
+    pub(crate) fn take_gpu_frame(&mut self) -> Option<Duration> {
+        self.gpu_frame.take()
     }
 
     pub(crate) fn record_gpu(&mut self, index: usize, elapsed: Duration) {
@@ -382,7 +392,7 @@ impl Pass for CullPass {
                 pass.dispatch_workgroups(*groups, 1, 1);
             }
         }
-        if draws.shadows_enabled {
+        if draws.shadows_enabled && !draws.shadow_reuse {
             for (index, groups) in draws.groups.iter().enumerate() {
                 if *groups > 0 {
                     pass.set_bind_group(0, &draws.binds[index][2], &[]);
@@ -417,7 +427,11 @@ impl Pass for ShadowPass {
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: &draws.shadow_view,
                 depth_ops: Some(wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(1.0),
+                    load: if draws.shadow_reuse {
+                        wgpu::LoadOp::Load
+                    } else {
+                        wgpu::LoadOp::Clear(1.0)
+                    },
                     store: wgpu::StoreOp::Store,
                 }),
                 stencil_ops: None,
@@ -426,7 +440,7 @@ impl Pass for ShadowPass {
             occlusion_query_set: None,
             multiview_mask: None,
         });
-        if !draws.shadows_enabled || draws.batches.is_empty() {
+        if !draws.shadows_enabled || draws.batches.is_empty() || draws.shadow_reuse {
             return;
         }
         pass.set_pipeline(&draws.shadow_pipeline);

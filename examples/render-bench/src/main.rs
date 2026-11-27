@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 
 use glam::{Mat4, Quat, Vec3};
 use weave_eye::{
-    Backend, Batch, CUBE, Camera, DrawInstance, FrameParams, FrameStats, Light, Renderer,
-    ShaderUpdate, Timing,
+    Backend, Batch, CUBE, Camera, DrawInstance, DynamicResolution, FrameParams, FrameStats, Light,
+    Renderer, ShaderUpdate, Timing,
 };
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
@@ -31,6 +31,9 @@ struct Options {
     sync: bool,
     lights: usize,
     size: (u32, u32),
+    dynres: bool,
+    budget_ms: f32,
+    min_scale: f32,
 }
 
 fn parse_options() -> Options {
@@ -44,6 +47,9 @@ fn parse_options() -> Options {
         sync: false,
         lights: 1,
         size: (800, 600),
+        dynres: false,
+        budget_ms: 16.7,
+        min_scale: 0.5,
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -69,6 +75,9 @@ fn parse_options() -> Options {
                 i += 2;
                 continue;
             }
+            "--dynres" => options.dynres = value == "on",
+            "--budget-ms" => options.budget_ms = value.parse().unwrap_or(options.budget_ms),
+            "--min-scale" => options.min_scale = value.parse().unwrap_or(options.min_scale),
             _ => {
                 i += 1;
                 continue;
@@ -146,6 +155,9 @@ struct Dense {
     submitted: usize,
     drawn_last: u64,
     measured: u64,
+    upload_sum: usize,
+    shadow_reused: u64,
+    scale_sum: f64,
 }
 
 struct Reload {
@@ -160,7 +172,7 @@ struct Reload {
 }
 
 enum Job {
-    Dense(Dense),
+    Dense(Box<Dense>),
     Reload(Reload),
 }
 
@@ -177,7 +189,7 @@ impl App {
     fn new(options: Options) -> Self {
         let size = options.size;
         let job = match options.scenario {
-            Scenario::Dense => Job::Dense(Dense {
+            Scenario::Dense => Job::Dense(Box::new(Dense {
                 instances: {
                     let mut instances = dense_instances(options.count);
                     if options.wall {
@@ -200,8 +212,11 @@ impl App {
                 frame_sum: Duration::ZERO,
                 submitted: 0,
                 drawn_last: 0,
+                upload_sum: 0,
+                shadow_reused: 0,
+                scale_sum: 0.0,
                 measured: 0,
-            }),
+            })),
             Scenario::Reload => {
                 let path = std::env::temp_dir().join("weaveeye-reload-test.wgsl");
                 fs::write(&path, EMBEDDED).expect("write the shader file");
@@ -296,6 +311,14 @@ fn snapshot(renderer: &Renderer) -> [Option<Timing>; 4] {
 fn dense_step(dense: &mut Dense, renderer: &mut Renderer) -> bool {
     let camera = dense_camera();
     let params = FrameParams::default();
+    if dense.frame == 0 && dense.options.dynres {
+        let budget = std::time::Duration::from_secs_f32(dense.options.budget_ms / 1000.0);
+        renderer.set_dynamic_resolution(Some(DynamicResolution::new(
+            budget,
+            dense.options.min_scale,
+            1.0,
+        )));
+    }
     if dense.frame == WARMUP {
         dense.warm = Some(snapshot(renderer));
     }
@@ -319,6 +342,9 @@ fn dense_step(dense: &mut Dense, renderer: &mut Renderer) -> bool {
         dense.frame_sum += elapsed;
         dense.cull_sum += stats.cull;
         dense.submitted += stats.submitted;
+        dense.upload_sum += stats.upload_bytes;
+        dense.shadow_reused += u64::from(stats.shadow_reused);
+        dense.scale_sum += f64::from(stats.render_scale);
         dense.measured += 1;
     }
     if dense.frame + 1 == dense.options.frames {
@@ -404,7 +430,7 @@ fn report(job: &Job, renderer: &Renderer) {
                 "gpu timestamps unsupported".to_owned()
             };
             println!(
-                "dense count={} lights={} cull={} sync={} frames={} | cpu opaque {:.1} us | cpu clear {:.1} us | {} | cull {:.1} us | frame {:.1} us | submitted {} | drawn {:.0}",
+                "dense count={} lights={} cull={} sync={} frames={} | cpu opaque {:.1} us | cpu clear {:.1} us | {} | cull {:.1} us | frame {:.1} us | submitted {} | drawn {:.0} | upload {} B/frame | shadow reused {}/{} | render scale {:.2}",
                 dense.options.count,
                 dense.lights.len(),
                 if dense.options.culling { "on" } else { "off" },
@@ -417,6 +443,10 @@ fn report(job: &Job, renderer: &Renderer) {
                 (dense.frame_sum / u32::try_from(measured).unwrap_or(1)).as_secs_f64() * 1e6,
                 dense.submitted / usize::try_from(measured).unwrap_or(1),
                 dense.drawn_last as f64,
+                dense.upload_sum / measured as usize,
+                dense.shadow_reused,
+                measured,
+                dense.scale_sum / measured as f64,
             );
         }
         Job::Reload(reload) => {
