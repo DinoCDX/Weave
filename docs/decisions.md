@@ -183,3 +183,54 @@ The project was built and tested with Rust 1.89.0 (`cargo build`, `cargo test`, 
 | D-93 | GPU timing gap | Frame times on this host (lavapipe, shared VM) vary by 10 to 15% between runs, which hides the frame-time effect of culling. GPU timestamp queries would measure the GPU work directly. Not built yet; the plan needs them for a stable E3.4 result. | Open |
 | D-94 | Windows compile check | The whole workspace type-checks for `x86_64-pc-windows-msvc`. Nothing has been run on Windows. | Partly met |
 | D-95 | Frame stats | `draw` returns `FrameStats` with the submitted count, the drawn count, and the CPU time of culling. `wait_idle` blocks until the GPU is done, for synchronised timing. | Confirmed |
+
+## Renderer round: GPU timing, lights, resolution
+
+| ID | Decision | Choice | Status |
+|---|---|---|---|
+| D-96 | GPU timestamp queries | Each render pass writes a start and end timestamp, when the adapter supports `TIMESTAMP_QUERY`. Results are copied into a ring of three readback buffers and read once the GPU is done, so the frame never waits for them. Without support, the report says GPU timing is unsupported. Closes D-93 for the software device. | Confirmed on lavapipe (B-007 to B-009) |
+| D-97 | Every pass begins a render pass | The placeholder `transparent` and `post` passes now begin empty render passes, so every pass always writes its timestamps. Without this, unwritten query slots would carry stale values. | Confirmed by tests and runs |
+| D-98 | Lights | `Light` is directional, point, or spot. Up to 16 lights go into the frame uniform. Attenuation is inverse-square with a smooth cut-off at the range. Excess lights are dropped and counted in `FrameStats::lights_dropped`. Replaces `DirectionalLight`. | Confirmed by encoding tests and a screenshot |
+| D-99 | Benchmark resolution | Benchmark entries state the window size. The renderer entries from B-007 on report GPU time. Media is captured at 1920x1080 for new entries; the earlier 800x600 media stays as history. `--size WxH` on the cube and benchmark binaries sets the window size. | Confirmed |
+| D-100 | Culling result | At 1080p, culling halves the drawn instances in the dense scene but does not reduce GPU opaque time, because the cost is pixel fill. Culling is kept for scenes where much of the content is off-screen; a scene like that is still needed to show its benefit. | Measured (B-008) |
+| D-101 | Remaining E3 items | Not built: LOD (E3.4 second half), PBR materials and compressed textures (E3.5), image-based lighting (E3.7), and a culling scene where content is mostly off-screen. Windows is type-checked only. | Open |
+
+## Renderer round: complex geometry, lighting, and batches
+
+| ID | Decision | Choice | Status |
+|---|---|---|---|
+| D-102 | Light limit | 64 lights per frame. The frame uniform is 4,176 bytes, below the 64 KB default binding limit. | Confirmed by test |
+| D-103 | Batches | `draw` takes a list of batches, each a mesh and its instances. One instance buffer holds every batch, and each batch records its own range. `add_mesh` uploads a mesh; `CUBE` is the built-in cube. | Confirmed by the showcase and the existing benchmarks |
+| D-104 | Index width | Every mesh uses 32-bit indices. A complex mesh needs more than 65,536 vertices, and the cube keeps the same format for simplicity. | Confirmed by test |
+| D-105 | Culling radius | Culling uses each mesh's bounding radius, scaled by the largest axis of the instance transform, rather than a fixed cube radius. | Confirmed by test |
+| D-106 | Procedural meshes | `cube`, `ground`, and `lobed_sphere` are built in code. Normals of the lobed sphere come from numerical partial derivatives of the surface, and point outward. | Confirmed by test |
+| D-107 | Light presets | `Light::key`, `Light::flood`, and `Light::accent` build the three roles the showcase uses. | Confirmed by test |
+| D-108 | Plateau | GPU time stops rising above about 16 lights on lavapipe, in two scenes (B-010, B-011). Cause not determined. Needs a physical GPU. | Open |
+
+## Renderer round: clustered lighting
+
+| ID | Decision | Choice | Status |
+|---|---|---|---|
+| D-109 | Clustered lighting | Lights are assigned on the CPU each frame to 16 by 9 screen tiles and 16 exponential depth slices. Each pixel shades only the lights in its own cluster. Replaces the per-pixel loop over every light. | Confirmed by tests and B-012 |
+| D-110 | Light limits | Up to 4,096 point and spot lights in a storage buffer, plus 4 directional lights in the uniform. Excess lights are dropped and counted in `FrameStats`. The old 64-light limit is gone. | Confirmed by test |
+| D-111 | Conservative assignment | A light is listed in every cluster that any point it reaches could fall in. Tile bounds account for the projected size of a sphere off the view axis. Lights wholly off-screen or behind the camera are dropped. The test samples points inside each light's range and fails if one is missing from its cluster. | Confirmed by tests |
+| D-112 | Performance status | Small lights scale (B-012). Large lights and a fixed per-pixel overhead make the clustered path slower than the per-pixel loop at low counts, and at 64 big lights. Not resolved. Needs a physical GPU and probably a light-size-aware path. | Open |
+
+## Renderer round: engine techniques for efficiency
+
+| ID | Decision | Choice | Status |
+|---|---|---|---|
+| D-113 | Exact cluster assignment | A light is listed in a cluster only if its sphere touches that cluster's frustum cell: the four side planes and the two depth planes. This follows the tile-and-cluster culling used in Forward+ renderers (Unity, Godot, Unreal) and is conservative. It halves the cost of large lights and cuts the top count by about a third (B-014). | Confirmed by tests (sampling test that fails on a missing light) and B-014 |
+| D-114 | Direct path for few lights | Below a light-count threshold, the renderer uses a direct variant of the shader that loops over every light and skips the cluster build. The variant is generated from the clustered shader text, so both always update together. Threshold four, from B-013; the clustered path takes over above it. | Confirmed by B-013 |
+| D-115 | Light path control | `Renderer::set_light_path` takes `Auto`, `Direct`, or `Clustered`. `Auto` is the default. The showcase exposes it as `--light-path`, so both paths can be measured on the same scene. | Confirmed |
+| D-116 | Reload covers both variants | A shader edit rebuilds the direct variant as well. A broken edit in either variant keeps the previous pair. The reload scenario still passes (broken edit rejected, cache restore). | Confirmed by tests and the reload scenario |
+| D-117 | Remaining gap to engine renderers | Not built: GPU-driven culling and indirect draws, per-cluster light lists built on the GPU, light-size-aware path selection beyond the count threshold, LOD, and clustered shadows. These are the next techniques from the same engines. | Open |
+
+## Renderer round: directional shadows
+
+| ID | Decision | Choice | Status |
+|---|---|---|---|
+| D-118 | Directional shadows | The first directional light casts shadows. A depth-only pass renders the scene from the light into a 2048 by 2048 map, using an orthographic frustum of 44 units centred on the origin. The lit shader compares depth against the map with a comparison sampler. The pass is the first node in the render graph. | Confirmed by the showcase screenshot |
+| D-119 | Shadow switch | `Renderer::set_shadows` turns shadows on or off (default on). Off means the shadow pass records an empty pass and the lit shader returns early on a uniform flag, so it costs nothing. | Confirmed by B-015 and B-016 |
+| D-120 | Lookup cost | Four hardware-filtered comparison taps, not nine. The comparison sampler already filters neighbouring texels, so four taps give soft edges at lower cost. | Confirmed by B-016 |
+| D-121 | Regression found by benchmark | The first shadow version computed the lookup for every pixel, even with shadows off, and was 30 ms slower in that case (B-016). Fixed by the early-out. Recorded so the cause is on record. | Fixed |

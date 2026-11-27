@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use glam::{Mat4, Quat, Vec3};
 use weave_eye::{
-    Backend, Camera, DirectionalLight, DrawInstance, DrawMode, FrameParams, FrameStats, Renderer,
+    Backend, Batch, CUBE, Camera, DrawInstance, DrawMode, FrameParams, FrameStats, Light, Renderer,
     ShaderUpdate, Timing,
 };
 use winit::application::ApplicationHandler;
@@ -28,6 +28,8 @@ struct Options {
     culling: bool,
     frames: u64,
     sync: bool,
+    lights: usize,
+    size: (u32, u32),
 }
 
 fn parse_options() -> Options {
@@ -38,6 +40,8 @@ fn parse_options() -> Options {
         culling: false,
         frames: 300,
         sync: false,
+        lights: 1,
+        size: (800, 600),
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -61,6 +65,8 @@ fn parse_options() -> Options {
             }
             "--cull" => options.culling = value == "on",
             "--frames" => options.frames = value.parse().unwrap_or(options.frames),
+            "--lights" => options.lights = value.parse().unwrap_or(options.lights),
+            "--size" => options.size = parse_size(&value).unwrap_or(options.size),
             "--sync" => {
                 options.sync = value == "on";
                 i += 2;
@@ -74,6 +80,11 @@ fn parse_options() -> Options {
         i += 2;
     }
     options
+}
+
+fn parse_size(text: &str) -> Option<(u32, u32)> {
+    let (w, h) = text.split_once('x')?;
+    Some((w.parse().ok()?, h.parse().ok()?))
 }
 
 fn dense_instances(count: usize) -> Vec<DrawInstance> {
@@ -96,6 +107,20 @@ fn dense_instances(count: usize) -> Vec<DrawInstance> {
         .collect()
 }
 
+fn dense_lights(count: usize) -> Vec<Light> {
+    let mut lights = vec![Light::default()];
+    for i in 1..count.max(1) {
+        let t = i as f32;
+        lights.push(Light::Point {
+            position: Vec3::new((t * 7.3).sin() * 40.0, 3.0, (t * 3.1).cos() * 40.0),
+            color: Vec3::new(0.9, 0.8, 0.6),
+            intensity: 3.0,
+            range: 15.0,
+        });
+    }
+    lights
+}
+
 fn dense_camera() -> Camera {
     Camera {
         eye: Vec3::new(0.0, 12.0, 70.0),
@@ -116,8 +141,9 @@ fn delta(now: Option<Timing>, before: Option<Timing>) -> Duration {
 struct Dense {
     options: Options,
     instances: Vec<DrawInstance>,
+    lights: Vec<Light>,
     frame: u64,
-    warm: Option<(Option<Timing>, Option<Timing>)>,
+    warm: Option<[Option<Timing>; 4]>,
     cull_sum: Duration,
     frame_sum: Duration,
     submitted: usize,
@@ -142,6 +168,7 @@ enum Job {
 }
 
 struct App {
+    size: (u32, u32),
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
     job: Job,
@@ -151,9 +178,11 @@ const WARMUP: u64 = 30;
 
 impl App {
     fn new(options: Options) -> Self {
+        let size = options.size;
         let job = match options.scenario {
             Scenario::Dense => Job::Dense(Dense {
                 instances: dense_instances(options.count),
+                lights: dense_lights(options.lights),
                 options,
                 frame: 0,
                 warm: None,
@@ -175,13 +204,14 @@ impl App {
                     broken_kept_drawing: false,
                     restored: None,
                     edited_text: EMBEDDED.replace(
-                        "return vec4<f32>(lit, input.color.a);",
-                        "return vec4<f32>(lit.b, lit.g, lit.r, input.color.a);",
+                        "return vec4<f32>(color, input.color.a);",
+                        "return vec4<f32>(color.b, color.g, color.r, input.color.a);",
                     ),
                 })
             }
         };
         Self {
+            size,
             window: None,
             renderer: None,
             job,
@@ -196,7 +226,11 @@ impl ApplicationHandler for App {
         }
         let window = Arc::new(
             event_loop
-                .create_window(Window::default_attributes().with_title("render-bench"))
+                .create_window(
+                    Window::default_attributes()
+                        .with_title("render-bench")
+                        .with_inner_size(winit::dpi::PhysicalSize::new(self.size.0, self.size.1)),
+                )
                 .expect("window"),
         );
         let size = window.inner_size();
@@ -240,19 +274,32 @@ impl ApplicationHandler for App {
     }
 }
 
+fn snapshot(renderer: &Renderer) -> [Option<Timing>; 4] {
+    [
+        renderer.pass_timing("opaque"),
+        renderer.pass_timing("clear"),
+        renderer.gpu_timing("opaque"),
+        renderer.gpu_timing("clear"),
+    ]
+}
+
 fn dense_step(dense: &mut Dense, renderer: &mut Renderer) -> bool {
     let camera = dense_camera();
-    let light = DirectionalLight::default();
     let params = FrameParams::default();
     if dense.frame == WARMUP {
-        dense.warm = Some((
-            renderer.pass_timing("opaque"),
-            renderer.pass_timing("clear"),
-        ));
+        dense.warm = Some(snapshot(renderer));
     }
     let started = Instant::now();
     let stats: FrameStats = renderer
-        .draw(&camera, &light, &params, &dense.instances)
+        .draw(
+            &camera,
+            &dense.lights,
+            &params,
+            &[Batch {
+                mesh: CUBE,
+                instances: &dense.instances,
+            }],
+        )
         .unwrap_or_else(|error| panic!("{error}"));
     if dense.options.sync {
         renderer.wait_idle();
@@ -271,7 +318,7 @@ fn dense_step(dense: &mut Dense, renderer: &mut Renderer) -> bool {
 
 fn reload_step(reload: &mut Reload, renderer: &mut Renderer) -> bool {
     let camera = Camera::default();
-    let light = DirectionalLight::default();
+    let lights = [Light::default()];
     let params = FrameParams::default();
     let frame = reload.frame;
 
@@ -306,7 +353,15 @@ fn reload_step(reload: &mut Reload, renderer: &mut Renderer) -> bool {
         model: Mat4::IDENTITY,
         color: [1.0, 0.5, 0.2, 1.0],
     }];
-    let drew = renderer.draw(&camera, &light, &params, &instances);
+    let drew = renderer.draw(
+        &camera,
+        &lights,
+        &params,
+        &[Batch {
+            mesh: CUBE,
+            instances: &instances,
+        }],
+    );
     if (120..180).contains(&frame)
         && let Ok(stats) = drew
     {
@@ -320,19 +375,33 @@ fn reload_step(reload: &mut Reload, renderer: &mut Renderer) -> bool {
 fn report(job: &Job, renderer: &Renderer) {
     match job {
         Job::Dense(dense) => {
-            let (opaque_before, clear_before) = dense.warm.unwrap_or((None, None));
-            let opaque = delta(renderer.pass_timing("opaque"), opaque_before);
-            let clear = delta(renderer.pass_timing("clear"), clear_before);
+            let before = dense.warm.unwrap_or([None; 4]);
+            let now = snapshot(renderer);
+            let opaque = delta(now[0], before[0]);
+            let clear = delta(now[1], before[1]);
+            let gpu_opaque = delta(now[2], before[2]);
+            let gpu_clear = delta(now[3], before[3]);
             let measured = dense.measured.max(1);
+            let gpu = if renderer.gpu_timestamps_supported() {
+                format!(
+                    "gpu opaque {:.1} us | gpu clear {:.1} us",
+                    gpu_opaque.as_secs_f64() * 1e6,
+                    gpu_clear.as_secs_f64() * 1e6
+                )
+            } else {
+                "gpu timestamps unsupported".to_owned()
+            };
             println!(
-                "dense count={} mode={:?} cull={} sync={} frames={} | opaque {:.1} us | clear {:.1} us | cull {:.1} us | frame {:.1} us | submitted {} | drawn {:.0}",
+                "dense count={} lights={} mode={:?} cull={} sync={} frames={} | cpu opaque {:.1} us | cpu clear {:.1} us | {} | cull {:.1} us | frame {:.1} us | submitted {} | drawn {:.0}",
                 dense.options.count,
+                dense.lights.len(),
                 dense.options.mode,
                 if dense.options.culling { "on" } else { "off" },
                 if dense.options.sync { "on" } else { "off" },
                 dense.options.frames,
                 opaque.as_secs_f64() * 1e6,
                 clear.as_secs_f64() * 1e6,
+                gpu,
                 (dense.cull_sum / u32::try_from(measured).unwrap_or(1)).as_secs_f64() * 1e6,
                 (dense.frame_sum / u32::try_from(measured).unwrap_or(1)).as_secs_f64() * 1e6,
                 dense.submitted / usize::try_from(measured).unwrap_or(1),

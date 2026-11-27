@@ -1,15 +1,22 @@
 mod backend;
 mod camera;
+mod cluster;
+mod gpu_timer;
 mod graph;
+mod lights;
 mod mesh;
 mod renderer;
 mod scene;
 mod shader;
 
 pub use backend::Backend;
-pub use camera::{Camera, DirectionalLight, FrameParams};
+pub use camera::{Camera, FrameParams};
 pub use graph::{GraphError, Pass, PassContext, RenderGraph, Timing};
-pub use mesh::{Vertex, cube_geometry};
-pub use renderer::{DrawInstance, DrawMode, FrameStats, RenderError, Renderer};
+pub use lights::{Light, MAX_DIRECTIONAL, MAX_LIGHTS};
+pub use mesh::{Mesh, Vertex, cube, ground, lobed_sphere};
+pub use renderer::{
+    Batch, CUBE, DIRECT_LIGHT_LIMIT, DrawInstance, DrawMode, FrameStats, LightPath, MeshHandle,
+    RenderError, Renderer,
+};
 pub use scene::{Renderable, collect_instances};
 pub use shader::{ShaderError, ShaderUpdate, content_hash};

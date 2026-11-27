@@ -19,6 +19,13 @@ Measure the heart's tick cost on this machine (release build, best of seven runs
 cargo run --release -p heart-bench
 ```
 
+Run the showcase (complex geometry, key, flood, and accent lights):
+
+```
+cargo run --release -p showcase -- --size 1920x1080
+cargo run --release -p showcase -- --size 1920x1080 --extra-lights 512 --extra-range 1.2
+```
+
 Run the lit cube demo (three spinning cubes, lit from one directional light):
 
 ```
@@ -60,12 +67,15 @@ examples/triangle     the Phase 0 wgpu triangle
 examples/heart-bench  tick-cost benchmark for WeaveHeart
 examples/cube         lit cube demo on the renderer (weave-eye)
 examples/render-bench renderer benchmarks: dense batching and culling, and shader reload
+examples/showcase     complex lobed sphere lit by a key, a flood, and an accent light
 crates/weave-eye      renderer (E3.1): backend choice, render graph, lit cubes
 docs/                 plan decisions, service reference
 scripts/              check scripts for each platform, and the Linux smoke test
 ```
 
 Renderer benchmarks: `target/release/render-bench --scenario dense --count 10000 --mode batched --cull on --sync on` and `--scenario reload`.
+
+Higher-resolution media (1920x1080) is in `docs/media/`.
 
 Benchmark results are kept in [docs/benchmarks.md](docs/benchmarks.md), with the command and environment for each run.
 

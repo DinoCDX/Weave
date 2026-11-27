@@ -1,5 +1,5 @@
 use glam::{Mat4, Vec3, Vec4};
-use weave_eye::{Backend, Camera, DrawInstance, Renderable, collect_instances, cube_geometry};
+use weave_eye::{Backend, Camera, DrawInstance, Renderable, collect_instances, cube};
 use weave_heart::{PlatformKey, Runtime, Transform};
 
 #[test]
@@ -21,11 +21,13 @@ fn each_platform_gets_its_backend() {
 
 #[test]
 fn the_cube_has_24_vertices_36_indices_and_unit_normals() {
-    let (vertices, indices) = cube_geometry();
+    let mesh = cube();
+    let vertices = &mesh.vertices;
+    let indices = &mesh.indices;
     assert_eq!(vertices.len(), 24);
     assert_eq!(indices.len(), 36);
-    assert!(indices.iter().all(|&i| usize::from(i) < vertices.len()));
-    for vertex in &vertices {
+    assert!(indices.iter().all(|&i| (i as usize) < vertices.len()));
+    for vertex in vertices {
         let normal = Vec3::from_array(vertex.normal);
         assert!((normal.length() - 1.0).abs() < 1e-6);
         assert!(vertex.position.iter().all(|c| c.abs() <= 0.5 + 1e-6));

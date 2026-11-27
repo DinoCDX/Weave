@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use glam::Quat;
 use weave_eye::{
-    Backend, Camera, DirectionalLight, DrawInstance, FrameParams, Renderable, Renderer,
+    Backend, Batch, CUBE, Camera, DrawInstance, FrameParams, Light, Renderable, Renderer,
     collect_instances,
 };
 use weave_heart::services::Time;
@@ -33,20 +33,21 @@ impl Script<(Time,)> for Spin {
 }
 
 struct App {
+    size: (u32, u32),
     max_frames: Option<u64>,
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
     runtime: Runtime,
     instances: Vec<DrawInstance>,
     camera: Camera,
-    light: DirectionalLight,
+    lights: Vec<Light>,
     params: FrameParams,
     last: Instant,
     frames: u64,
 }
 
 impl App {
-    fn new(max_frames: Option<u64>) -> Self {
+    fn new(max_frames: Option<u64>, size: (u32, u32)) -> Self {
         let mut runtime = Runtime::new();
         let layout = [
             (-1.6, [0.9, 0.3, 0.25, 1.0], 0.7),
@@ -79,13 +80,22 @@ impl App {
             runtime.commands().load(object);
         }
         Self {
+            size,
             max_frames,
             window: None,
             renderer: None,
             runtime,
             instances: Vec::new(),
             camera: Camera::default(),
-            light: DirectionalLight::default(),
+            lights: vec![
+                Light::default(),
+                Light::Point {
+                    position: glam::Vec3::new(0.0, 1.5, 2.0),
+                    color: glam::Vec3::new(1.0, 0.7, 0.4),
+                    intensity: 4.0,
+                    range: 8.0,
+                },
+            ],
             params: FrameParams::default(),
             last: Instant::now(),
             frames: 0,
@@ -103,8 +113,15 @@ impl App {
         }
         collect_instances(&self.runtime, &mut self.instances);
         if let Some(renderer) = self.renderer.as_mut()
-            && let Err(error) =
-                renderer.draw(&self.camera, &self.light, &self.params, &self.instances)
+            && let Err(error) = renderer.draw(
+                &self.camera,
+                &self.lights,
+                &self.params,
+                &[Batch {
+                    mesh: CUBE,
+                    instances: &self.instances,
+                }],
+            )
         {
             eprintln!("{error}");
         }
@@ -119,7 +136,11 @@ impl ApplicationHandler for App {
         }
         let window = Arc::new(
             event_loop
-                .create_window(Window::default_attributes().with_title("WeaveEngineX cube"))
+                .create_window(
+                    Window::default_attributes()
+                        .with_title("WeaveEngineX cube")
+                        .with_inner_size(winit::dpi::PhysicalSize::new(self.size.0, self.size.1)),
+                )
                 .expect("window"),
         );
         let size = window.inner_size();
@@ -184,8 +205,23 @@ fn parse_frame_limit() -> Option<u64> {
     None
 }
 
+fn parse_size() -> (u32, u32) {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--size"
+            && let Some((w, h)) = args
+                .next()
+                .and_then(|v| v.split_once('x').map(|(w, h)| (w.to_owned(), h.to_owned())))
+            && let (Ok(w), Ok(h)) = (w.parse(), h.parse())
+        {
+            return (w, h);
+        }
+    }
+    (800, 600)
+}
+
 fn main() {
     let event_loop = EventLoop::new().expect("event loop");
-    let mut app = App::new(parse_frame_limit());
+    let mut app = App::new(parse_frame_limit(), parse_size());
     event_loop.run_app(&mut app).expect("event loop failed");
 }

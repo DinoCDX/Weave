@@ -12,10 +12,16 @@ pub struct Camera {
 }
 
 impl Camera {
+    pub fn view(&self) -> Mat4 {
+        view::look_at_mat4(self.eye, self.target, self.up)
+    }
+
+    pub fn projection(&self, aspect: f32) -> Mat4 {
+        directx::perspective(self.fov_y_radians, aspect, self.near, self.far)
+    }
+
     pub fn view_proj(&self, aspect: f32) -> Mat4 {
-        let projection = directx::perspective(self.fov_y_radians, aspect, self.near, self.far);
-        let view = view::look_at_mat4(self.eye, self.target, self.up);
-        projection * view
+        self.projection(aspect) * self.view()
     }
 }
 
@@ -28,23 +34,6 @@ impl Default for Camera {
             fov_y_radians: 60f32.to_radians(),
             near: 0.1,
             far: 100.0,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct DirectionalLight {
-    pub direction: Vec3,
-    pub color: Vec3,
-    pub intensity: f32,
-}
-
-impl Default for DirectionalLight {
-    fn default() -> Self {
-        Self {
-            direction: Vec3::new(-0.4, -1.0, -0.6).normalize(),
-            color: Vec3::ONE,
-            intensity: 1.0,
         }
     }
 }
