@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use glam::{Mat4, Quat, Vec3};
 use weave_eye::{
-    Backend, Batch, CUBE, Camera, DrawInstance, DrawMode, FrameParams, FrameStats, Light, Renderer,
+    Backend, Batch, CUBE, Camera, DrawInstance, FrameParams, FrameStats, Light, Renderer,
     ShaderUpdate, Timing,
 };
 use winit::application::ApplicationHandler;
@@ -24,8 +24,9 @@ enum Scenario {
 struct Options {
     scenario: Scenario,
     count: usize,
-    mode: DrawMode,
     culling: bool,
+    occlusion: bool,
+    wall: bool,
     frames: u64,
     sync: bool,
     lights: usize,
@@ -36,8 +37,9 @@ fn parse_options() -> Options {
     let mut options = Options {
         scenario: Scenario::Dense,
         count: 10_000,
-        mode: DrawMode::Batched,
         culling: false,
+        occlusion: true,
+        wall: false,
         frames: 300,
         sync: false,
         lights: 1,
@@ -56,14 +58,9 @@ fn parse_options() -> Options {
                 }
             }
             "--count" => options.count = value.parse().unwrap_or(options.count),
-            "--mode" => {
-                options.mode = if value == "unbatched" {
-                    DrawMode::Unbatched
-                } else {
-                    DrawMode::Batched
-                }
-            }
             "--cull" => options.culling = value == "on",
+            "--occlusion" => options.occlusion = value != "off",
+            "--wall" => options.wall = value == "on",
             "--frames" => options.frames = value.parse().unwrap_or(options.frames),
             "--lights" => options.lights = value.parse().unwrap_or(options.lights),
             "--size" => options.size = parse_size(&value).unwrap_or(options.size),
@@ -95,14 +92,14 @@ fn dense_instances(count: usize) -> Vec<DrawInstance> {
             let x = ((i % side) as f32 - half) * 1.2;
             let z = ((i / side) as f32 - half) * 1.2;
             let shade = 0.3 + 0.7 * ((i % 7) as f32 / 6.0);
-            DrawInstance {
-                model: Mat4::from_scale_rotation_translation(
+            DrawInstance::new(
+                Mat4::from_scale_rotation_translation(
                     Vec3::splat(0.5),
                     Quat::IDENTITY,
                     Vec3::new(x, 0.0, z),
                 ),
-                color: [shade, 0.5, 1.0 - shade, 1.0],
-            }
+                [shade, 0.5, 1.0 - shade, 1.0],
+            )
         })
         .collect()
 }
@@ -147,7 +144,7 @@ struct Dense {
     cull_sum: Duration,
     frame_sum: Duration,
     submitted: usize,
-    drawn_sum: u64,
+    drawn_last: u64,
     measured: u64,
 }
 
@@ -181,7 +178,20 @@ impl App {
         let size = options.size;
         let job = match options.scenario {
             Scenario::Dense => Job::Dense(Dense {
-                instances: dense_instances(options.count),
+                instances: {
+                    let mut instances = dense_instances(options.count);
+                    if options.wall {
+                        instances.push(DrawInstance::new(
+                            Mat4::from_scale_rotation_translation(
+                                Vec3::new(120.0, 40.0, 1.0),
+                                Quat::IDENTITY,
+                                Vec3::new(0.0, 10.0, 40.0),
+                            ),
+                            [0.6, 0.6, 0.65, 1.0],
+                        ));
+                    }
+                    instances
+                },
                 lights: dense_lights(options.lights),
                 options,
                 frame: 0,
@@ -189,7 +199,7 @@ impl App {
                 cull_sum: Duration::ZERO,
                 frame_sum: Duration::ZERO,
                 submitted: 0,
-                drawn_sum: 0,
+                drawn_last: 0,
                 measured: 0,
             }),
             Scenario::Reload => {
@@ -237,8 +247,8 @@ impl ApplicationHandler for App {
         let mut renderer = Renderer::new(window.clone(), size.width, size.height, Backend::Vulkan)
             .unwrap_or_else(|error| panic!("{error}"));
         if let Job::Dense(dense) = &self.job {
-            renderer.set_draw_mode(dense.options.mode);
             renderer.set_culling(dense.options.culling);
+            renderer.set_occlusion_culling(dense.options.occlusion);
         }
         if let Job::Reload(reload) = &self.job {
             renderer
@@ -309,8 +319,14 @@ fn dense_step(dense: &mut Dense, renderer: &mut Renderer) -> bool {
         dense.frame_sum += elapsed;
         dense.cull_sum += stats.cull;
         dense.submitted += stats.submitted;
-        dense.drawn_sum += u64::from(stats.drawn);
         dense.measured += 1;
+    }
+    if dense.frame + 1 == dense.options.frames {
+        dense.drawn_last = renderer
+            .visible_counts()
+            .iter()
+            .map(|count| u64::from(*count))
+            .sum();
     }
     dense.frame += 1;
     dense.frame >= dense.options.frames
@@ -349,10 +365,7 @@ fn reload_step(reload: &mut Reload, renderer: &mut Renderer) -> bool {
         _ => {}
     }
 
-    let instances = [DrawInstance {
-        model: Mat4::IDENTITY,
-        color: [1.0, 0.5, 0.2, 1.0],
-    }];
+    let instances = [DrawInstance::new(Mat4::IDENTITY, [1.0, 0.5, 0.2, 1.0])];
     let drew = renderer.draw(
         &camera,
         &lights,
@@ -362,10 +375,9 @@ fn reload_step(reload: &mut Reload, renderer: &mut Renderer) -> bool {
             instances: &instances,
         }],
     );
-    if (120..180).contains(&frame)
-        && let Ok(stats) = drew
-    {
-        reload.broken_kept_drawing = stats.drawn == 1 && renderer.shader_error().is_some();
+    if (120..180).contains(&frame) && drew.is_ok() {
+        reload.broken_kept_drawing =
+            renderer.visible_counts().first() == Some(&1) && renderer.shader_error().is_some();
     }
 
     reload.frame += 1;
@@ -392,10 +404,9 @@ fn report(job: &Job, renderer: &Renderer) {
                 "gpu timestamps unsupported".to_owned()
             };
             println!(
-                "dense count={} lights={} mode={:?} cull={} sync={} frames={} | cpu opaque {:.1} us | cpu clear {:.1} us | {} | cull {:.1} us | frame {:.1} us | submitted {} | drawn {:.0}",
+                "dense count={} lights={} cull={} sync={} frames={} | cpu opaque {:.1} us | cpu clear {:.1} us | {} | cull {:.1} us | frame {:.1} us | submitted {} | drawn {:.0}",
                 dense.options.count,
                 dense.lights.len(),
-                dense.options.mode,
                 if dense.options.culling { "on" } else { "off" },
                 if dense.options.sync { "on" } else { "off" },
                 dense.options.frames,
@@ -405,7 +416,7 @@ fn report(job: &Job, renderer: &Renderer) {
                 (dense.cull_sum / u32::try_from(measured).unwrap_or(1)).as_secs_f64() * 1e6,
                 (dense.frame_sum / u32::try_from(measured).unwrap_or(1)).as_secs_f64() * 1e6,
                 dense.submitted / usize::try_from(measured).unwrap_or(1),
-                dense.drawn_sum as f64 / measured as f64,
+                dense.drawn_last as f64,
             );
         }
         Job::Reload(reload) => {

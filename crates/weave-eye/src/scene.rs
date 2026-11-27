@@ -34,8 +34,5 @@ fn push_if_renderable(runtime: &Runtime, object: ObjectHandle, out: &mut Vec<Dra
     let Some(transform) = world.transform(object) else {
         return;
     };
-    out.push(DrawInstance {
-        model: model_matrix(&transform),
-        color,
-    });
+    out.push(DrawInstance::new(model_matrix(&transform), color));
 }

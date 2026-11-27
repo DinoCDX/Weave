@@ -31,6 +31,7 @@ struct VertexIn {
     @location(5) model_2: vec4<f32>,
     @location(6) model_3: vec4<f32>,
     @location(7) color: vec4<f32>,
+    @location(8) material: vec4<f32>,
 }
 
 struct VertexOut {
@@ -39,6 +40,16 @@ struct VertexOut {
     @location(1) color: vec4<f32>,
     @location(2) world: vec3<f32>,
     @location(3) depth: f32,
+    @location(4) material: vec4<f32>,
+}
+
+struct Surface {
+    n: vec3<f32>,
+    v: vec3<f32>,
+    world: vec3<f32>,
+    albedo: vec3<f32>,
+    metallic: f32,
+    roughness: f32,
 }
 
 @vertex
@@ -51,17 +62,45 @@ fn vs_main(v: VertexIn) -> VertexOut {
     out.color = v.color;
     out.world = world;
     out.depth = -(frame.view * vec4<f32>(world, 1.0)).z;
+    out.material = v.material;
     return out;
 }
 
-fn shade(light: Light, n: vec3<f32>, world: vec3<f32>) -> vec3<f32> {
+fn distribution_ggx(n_dot_h: f32, a2: f32) -> f32 {
+    let denom = n_dot_h * n_dot_h * (a2 - 1.0) + 1.0;
+    return a2 / (denom * denom);
+}
+
+fn visibility_smith(n_dot_v: f32, n_dot_l: f32, a2: f32) -> f32 {
+    let gv = n_dot_l * sqrt(n_dot_v * n_dot_v * (1.0 - a2) + a2);
+    let gl = n_dot_v * sqrt(n_dot_l * n_dot_l * (1.0 - a2) + a2);
+    return 0.5 / max(gv + gl, 0.0001);
+}
+
+fn brdf(s: Surface, l: vec3<f32>) -> vec3<f32> {
+    let h = normalize(s.v + l);
+    let n_dot_v = max(dot(s.n, s.v), 0.0001);
+    let n_dot_l = max(dot(s.n, l), 0.0001);
+    let n_dot_h = max(dot(s.n, h), 0.0);
+    let v_dot_h = max(dot(s.v, h), 0.0);
+    let roughness = clamp(s.roughness, 0.045, 1.0);
+    let a = roughness * roughness;
+    let a2 = a * a;
+    let f0 = mix(vec3<f32>(0.04), s.albedo, s.metallic);
+    let fresnel = f0 + (vec3<f32>(1.0) - f0) * pow(1.0 - v_dot_h, 5.0);
+    let specular = distribution_ggx(n_dot_h, a2) * visibility_smith(n_dot_v, n_dot_l, a2) * fresnel;
+    let diffuse = (vec3<f32>(1.0) - fresnel) * (1.0 - s.metallic) * s.albedo;
+    return diffuse + specular;
+}
+
+fn shade(light: Light, s: Surface) -> vec3<f32> {
     let kind = u32(light.position_type.w);
     var l = vec3<f32>(0.0, 1.0, 0.0);
     var attenuation = 1.0;
     if (kind == 0u) {
         l = -normalize(light.direction.xyz);
     } else {
-        let to_light = light.position_type.xyz - world;
+        let to_light = light.position_type.xyz - s.world;
         let distance = length(to_light);
         l = to_light / max(distance, 0.0001);
         let range = max(light.params.x, 0.0001);
@@ -72,8 +111,18 @@ fn shade(light: Light, n: vec3<f32>, world: vec3<f32>) -> vec3<f32> {
             attenuation = attenuation * smoothstep(light.params.z, light.params.y, along);
         }
     }
-    let lambert = max(dot(n, l), 0.0);
-    return light.color_intensity.rgb * light.color_intensity.w * attenuation * lambert;
+    let n_dot_l = max(dot(s.n, l), 0.0);
+    if (n_dot_l <= 0.0) {
+        return vec3<f32>(0.0);
+    }
+    let radiance = light.color_intensity.rgb * light.color_intensity.w * attenuation;
+    return brdf(s, l) * radiance * n_dot_l;
+}
+
+fn aces(x: vec3<f32>) -> vec3<f32> {
+    let numerator = x * (2.51 * x + vec3<f32>(0.03));
+    let denominator = x * (2.43 * x + vec3<f32>(0.59)) + vec3<f32>(0.14);
+    return clamp(numerator / denominator, vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
 fn cluster_index(pixel: vec2<f32>, depth: f32) -> u32 {
@@ -112,11 +161,21 @@ fn shadow_factor(world: vec3<f32>, n: vec3<f32>) -> f32 {
 @fragment
 fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     let n = normalize(input.normal);
+    let rotation = mat3x3<f32>(frame.view[0].xyz, frame.view[1].xyz, frame.view[2].xyz);
+    let eye = -(transpose(rotation) * frame.view[3].xyz);
+    let surf = Surface(
+        n,
+        normalize(eye - input.world),
+        input.world,
+        input.color.rgb,
+        input.material.x,
+        input.material.y,
+    );
     var direct = vec3<f32>(0.0);
     let directional_count = u32(frame.viewport.z);
     let visibility = shadow_factor(input.world, n);
     for (var i = 0u; i < directional_count; i++) {
-        var contribution = shade(frame.directional[i], n, input.world);
+        var contribution = shade(frame.directional[i], surf);
         if (i == 0u) {
             contribution = contribution * visibility;
         }
@@ -126,9 +185,9 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     let range = cluster_ranges[cluster];
     for (var k = 0u; k < range.y; k++) {
         let light = lights[light_indices[range.x + k]];
-        direct = direct + shade(light, n, input.world);
+        direct = direct + shade(light, surf);
     }
-    let ambient = vec3<f32>(frame.params.y);
-    let color = (direct + ambient) * input.color.rgb * frame.params.x;
-    return vec4<f32>(color, input.color.a);
+    let ambient = frame.params.y * input.color.rgb * (1.0 - input.material.x);
+    let color = (direct + ambient) * frame.params.x;
+    return vec4<f32>(aces(color), input.color.a);
 }

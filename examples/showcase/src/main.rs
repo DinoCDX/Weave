@@ -19,6 +19,8 @@ struct Options {
     extra_range: f32,
     path: weave_eye::LightPath,
     shadows: bool,
+    occlusion: bool,
+    still: bool,
 }
 
 fn parse_options() -> Options {
@@ -29,6 +31,8 @@ fn parse_options() -> Options {
         extra_range: 6.0,
         path: weave_eye::LightPath::Auto,
         shadows: true,
+        occlusion: true,
+        still: false,
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -44,6 +48,8 @@ fn parse_options() -> Options {
             "--frames" => options.frames = args[i + 1].parse().ok(),
             "--extra-lights" => options.extra_lights = args[i + 1].parse().unwrap_or(0),
             "--shadows" => options.shadows = args[i + 1] != "off",
+            "--occlusion" => options.occlusion = args[i + 1] != "off",
+            "--still" => options.still = args[i + 1] == "on",
             "--extra-range" => options.extra_range = args[i + 1].parse().unwrap_or(6.0),
             "--light-path" => {
                 options.path = match args[i + 1].as_str() {
@@ -142,19 +148,21 @@ impl App {
         let Some(scene) = self.scene.as_mut() else {
             return;
         };
-        let angle = self.started.elapsed().as_secs_f32() * 0.4;
-        let sphere = [DrawInstance {
-            model: Mat4::from_scale_rotation_translation(
+        let angle = if self.options.still {
+            0.6
+        } else {
+            self.started.elapsed().as_secs_f32() * 0.4
+        };
+        let sphere = [DrawInstance::new(
+            Mat4::from_scale_rotation_translation(
                 Vec3::splat(1.6),
                 Quat::from_rotation_y(angle),
                 Vec3::new(0.0, 0.2, 0.0),
             ),
-            color: [0.78, 0.62, 0.45, 1.0],
-        }];
-        scene.ground_instances[0] = DrawInstance {
-            model: Mat4::IDENTITY,
-            color: [0.36, 0.37, 0.42, 1.0],
-        };
+            [0.78, 0.62, 0.45, 1.0],
+        )
+        .with_material(0.9, 0.22)];
+        scene.ground_instances[0] = DrawInstance::new(Mat4::IDENTITY, [0.36, 0.37, 0.42, 1.0]);
         let batches = [
             Batch {
                 mesh: scene.ground,
@@ -200,29 +208,32 @@ impl ApplicationHandler for App {
         renderer.set_culling(true);
         renderer.set_light_path(self.options.path);
         renderer.set_shadows(self.options.shadows);
-        let sphere = renderer.add_mesh(&lobed_sphere(256, 128));
+        renderer.set_occlusion_culling(self.options.occlusion);
+        let sphere = renderer.add_mesh_lods(&[
+            lobed_sphere(256, 128),
+            lobed_sphere(128, 64),
+            lobed_sphere(48, 24),
+            lobed_sphere(16, 8),
+        ]);
         let ground = renderer.add_mesh(&ground(30.0, -1.4));
         let cubes = (0..6)
             .map(|i| {
                 let angle = i as f32 / 6.0 * std::f32::consts::TAU;
-                DrawInstance {
-                    model: Mat4::from_scale_rotation_translation(
+                DrawInstance::new(
+                    Mat4::from_scale_rotation_translation(
                         Vec3::splat(0.6),
                         Quat::from_rotation_y(angle),
                         Vec3::new(angle.cos() * 3.2, -0.7, angle.sin() * 3.2),
                     ),
-                    color: [0.3 + 0.1 * i as f32, 0.45, 0.8 - 0.1 * i as f32, 1.0],
-                }
+                    [0.3 + 0.1 * i as f32, 0.45, 0.8 - 0.1 * i as f32, 1.0],
+                )
             })
             .collect();
         self.scene = Some(Scene {
             sphere,
             ground,
             cubes,
-            ground_instances: [DrawInstance {
-                model: Mat4::IDENTITY,
-                color: [0.5; 4],
-            }],
+            ground_instances: [DrawInstance::new(Mat4::IDENTITY, [0.5; 4])],
         });
         self.renderer = Some(renderer);
         self.window = Some(window);

@@ -242,11 +242,11 @@ impl Pass for OpaquePass {
     }
 
     fn reads(&self) -> &'static [&'static str] {
-        &["color", "depth", "shadow"]
+        &["color", "depth", "depth2", "shadow", "cull", "cull2"]
     }
 
     fn writes(&self) -> &'static [&'static str] {
-        &["color", "depth"]
+        &["color"]
     }
 
     fn record(&mut self, cx: &mut PassContext<'_>) {
@@ -275,7 +275,7 @@ impl Pass for OpaquePass {
             occlusion_query_set: None,
             multiview_mask: None,
         });
-        if draws.instance_count == 0 {
+        if draws.batches.is_empty() {
             return;
         }
         pass.set_pipeline(if draws.use_direct {
@@ -284,25 +284,9 @@ impl Pass for OpaquePass {
             &draws.pipeline
         });
         pass.set_bind_group(0, &draws.bind_group, &[]);
-        pass.set_vertex_buffer(1, draws.instances.slice(..));
-        for batch in &draws.batches {
-            if batch.count == 0 {
-                continue;
-            }
-            let mesh = &draws.meshes[batch.mesh];
-            pass.set_vertex_buffer(0, mesh.vertices.slice(..));
-            pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
-            if draws.unbatched {
-                for instance in batch.first..batch.first + batch.count {
-                    pass.draw_indexed(0..mesh.index_count, 0, instance..instance + 1);
-                }
-            } else {
-                pass.draw_indexed(
-                    0..mesh.index_count,
-                    0,
-                    batch.first..batch.first + batch.count,
-                );
-            }
+        draw_indirect(&mut pass, draws, &draws.camera_compact, 0);
+        if draws.occlusion_active {
+            draw_indirect(&mut pass, draws, &draws.camera_compact2, 1);
         }
     }
 }
@@ -367,6 +351,48 @@ fn empty_pass(cx: &mut PassContext<'_>, label: &'static str) {
     });
 }
 
+pub(crate) struct CullPass;
+
+impl Pass for CullPass {
+    fn name(&self) -> &'static str {
+        "cull"
+    }
+
+    fn reads(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    fn writes(&self) -> &'static [&'static str] {
+        &["cull"]
+    }
+
+    fn record(&mut self, cx: &mut PassContext<'_>) {
+        let draws = cx.draws;
+        if draws.batches.is_empty() {
+            return;
+        }
+        let mut pass = cx.encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("cull"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&draws.cull_pipeline);
+        for (index, groups) in draws.groups.iter().enumerate() {
+            if *groups > 0 {
+                pass.set_bind_group(0, &draws.binds[index][0], &[]);
+                pass.dispatch_workgroups(*groups, 1, 1);
+            }
+        }
+        if draws.shadows_enabled {
+            for (index, groups) in draws.groups.iter().enumerate() {
+                if *groups > 0 {
+                    pass.set_bind_group(0, &draws.binds[index][2], &[]);
+                    pass.dispatch_workgroups(*groups, 1, 1);
+                }
+            }
+        }
+    }
+}
+
 pub(crate) struct ShadowPass;
 
 impl Pass for ShadowPass {
@@ -375,7 +401,7 @@ impl Pass for ShadowPass {
     }
 
     fn reads(&self) -> &'static [&'static str] {
-        &[]
+        &["cull"]
     }
 
     fn writes(&self) -> &'static [&'static str] {
@@ -400,23 +426,192 @@ impl Pass for ShadowPass {
             occlusion_query_set: None,
             multiview_mask: None,
         });
-        if !draws.shadows_enabled || draws.instance_count == 0 {
+        if !draws.shadows_enabled || draws.batches.is_empty() {
             return;
         }
         pass.set_pipeline(&draws.shadow_pipeline);
         pass.set_bind_group(0, &draws.shadow_bind_group, &[]);
-        pass.set_vertex_buffer(1, draws.instances.slice(..));
-        for batch in &draws.batches {
-            if batch.count == 0 {
-                continue;
+        draw_indirect(&mut pass, draws, &draws.shadow_compact, 2);
+    }
+}
+
+pub(crate) struct DepthPass;
+
+impl Pass for DepthPass {
+    fn name(&self) -> &'static str {
+        "depth"
+    }
+
+    fn reads(&self) -> &'static [&'static str] {
+        &["cull", "depth"]
+    }
+
+    fn writes(&self) -> &'static [&'static str] {
+        &["depth"]
+    }
+
+    fn record(&mut self, cx: &mut PassContext<'_>) {
+        let draws = cx.draws;
+        let timestamp_writes = cx.timestamp_writes();
+        let mut pass = cx.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("depth"),
+            color_attachments: &[],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: cx.depth,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        if draws.batches.is_empty() {
+            return;
+        }
+        pass.set_pipeline(&draws.depth_pipeline);
+        pass.set_bind_group(0, &draws.bind_group, &[]);
+        draw_indirect(&mut pass, draws, &draws.camera_compact, 0);
+    }
+}
+
+pub(crate) struct HzbPass;
+
+impl Pass for HzbPass {
+    fn name(&self) -> &'static str {
+        "hzb"
+    }
+
+    fn reads(&self) -> &'static [&'static str] {
+        &["depth"]
+    }
+
+    fn writes(&self) -> &'static [&'static str] {
+        &["hzb"]
+    }
+
+    fn record(&mut self, cx: &mut PassContext<'_>) {
+        let draws = cx.draws;
+        if !draws.build_hzb {
+            return;
+        }
+        let hzb = &draws.hzb;
+        let mut pass = cx.encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("hzb"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&draws.hzb_l0_pipeline);
+        pass.set_bind_group(0, &hzb.l0, &[]);
+        let (width, height) = hzb.dims[0];
+        pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
+        pass.set_pipeline(&draws.hzb_down_pipeline);
+        for (index, bind) in hzb.down.iter().enumerate() {
+            let (width, height) = hzb.dims[index + 1];
+            pass.set_bind_group(0, bind, &[]);
+            pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
+        }
+    }
+}
+
+pub(crate) struct CullPhase2Pass;
+
+impl Pass for CullPhase2Pass {
+    fn name(&self) -> &'static str {
+        "cull2"
+    }
+
+    fn reads(&self) -> &'static [&'static str] {
+        &["hzb", "cull"]
+    }
+
+    fn writes(&self) -> &'static [&'static str] {
+        &["cull2"]
+    }
+
+    fn record(&mut self, cx: &mut PassContext<'_>) {
+        let draws = cx.draws;
+        if !draws.occlusion_active || draws.batches.is_empty() {
+            return;
+        }
+        let mut pass = cx.encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("cull2"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&draws.cull_pipeline);
+        for (index, groups) in draws.groups.iter().enumerate() {
+            if *groups > 0 {
+                pass.set_bind_group(0, &draws.binds[index][1], &[]);
+                pass.dispatch_workgroups(*groups, 1, 1);
             }
-            let mesh = &draws.meshes[batch.mesh];
-            pass.set_vertex_buffer(0, mesh.vertices.slice(..));
-            pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(
-                0..mesh.index_count,
-                0,
-                batch.first..batch.first + batch.count,
+        }
+    }
+}
+
+pub(crate) struct DepthPass2;
+
+impl Pass for DepthPass2 {
+    fn name(&self) -> &'static str {
+        "depth2"
+    }
+
+    fn reads(&self) -> &'static [&'static str] {
+        &["cull2", "depth"]
+    }
+
+    fn writes(&self) -> &'static [&'static str] {
+        &["depth2"]
+    }
+
+    fn record(&mut self, cx: &mut PassContext<'_>) {
+        let draws = cx.draws;
+        if !draws.occlusion_active || draws.batches.is_empty() {
+            return;
+        }
+        let timestamp_writes = cx.timestamp_writes();
+        let mut pass = cx.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("depth2"),
+            color_attachments: &[],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: cx.depth,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&draws.depth_pipeline);
+        pass.set_bind_group(0, &draws.bind_group, &[]);
+        draw_indirect(&mut pass, draws, &draws.camera_compact2, 1);
+    }
+}
+
+fn draw_indirect(
+    pass: &mut wgpu::RenderPass<'_>,
+    draws: &crate::renderer::DrawResources,
+    instances: &wgpu::Buffer,
+    args_index: usize,
+) {
+    for (index, batch) in draws.batches.iter().enumerate() {
+        if batch.count == 0 {
+            continue;
+        }
+        let mesh = &draws.meshes[batch.mesh];
+        let slot = &draws.slots[index];
+        for (lod_index, lod) in mesh.lods.iter().enumerate() {
+            let offset = (lod_index as u64 * draws.capacity as u64 + u64::from(batch.first))
+                * crate::renderer::INSTANCE_BYTES;
+            pass.set_vertex_buffer(0, lod.vertices.slice(..));
+            pass.set_vertex_buffer(1, instances.slice(offset..));
+            pass.set_index_buffer(lod.indices.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed_indirect(
+                &slot.args[args_index],
+                lod_index as u64 * crate::renderer::ARGS_BYTES,
             );
         }
     }
@@ -424,8 +619,13 @@ impl Pass for ShadowPass {
 
 pub(crate) fn default_passes() -> Vec<Box<dyn Pass>> {
     vec![
+        Box::new(CullPass),
         Box::new(ShadowPass),
         Box::new(ClearPass),
+        Box::new(DepthPass),
+        Box::new(HzbPass),
+        Box::new(CullPhase2Pass),
+        Box::new(DepthPass2),
         Box::new(OpaquePass),
         Box::new(TransparentPass),
         Box::new(PostPass),
@@ -512,10 +712,32 @@ mod tests {
         let graph = RenderGraph::new(default_passes()).expect("default passes are valid");
         assert_eq!(
             graph.pass_names(),
-            vec!["shadow", "clear", "opaque", "transparent", "post"]
+            vec![
+                "cull",
+                "shadow",
+                "clear",
+                "depth",
+                "hzb",
+                "cull2",
+                "depth2",
+                "opaque",
+                "transparent",
+                "post"
+            ]
         );
         let report = graph.report();
-        for name in ["shadow", "clear", "opaque", "transparent", "post"] {
+        for name in [
+            "cull",
+            "shadow",
+            "clear",
+            "depth",
+            "hzb",
+            "cull2",
+            "depth2",
+            "opaque",
+            "transparent",
+            "post",
+        ] {
             assert!(report.contains(name), "report lists {name}");
         }
         assert_eq!(graph.timing("opaque").unwrap().calls, 0);

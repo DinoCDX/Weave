@@ -312,3 +312,60 @@ What it shows: ...
 What it does not show: ...
 Compared with: B-00M (same environment), or "no comparable entry".
 ```
+
+## B-017: GPU-driven culling, depth prepass, and PBR, A/B against the original (lavapipe)
+
+Command, run on the same session and machine for every row: `render-bench --scenario dense --count 10000 --cull on --sync on --frames 200` at the default 800x600 window, one light, two runs per row. The original build is the uploaded zip before the renderer pass. The original's render-bench was built with shadows switched off in its source for the "shadows off" rows, and the new build's was switched off the same way. Scratch copies were used for the "prepass off" row. Code state: the renderer pass that adds GPU culling (`cull` pass with indirect draws), the depth prepass (`depth` pass), GGX shading with ACES tone mapping, and the shadow-caster fix.
+
+Environment: as in the header of this file. Lavapipe runs the GPU work on the same CPU, so every number is CPU-bound and none is a real GPU measurement. This session is slower than B-004's: the original build measures 70 to 71 ms per frame here, against 21 to 24 ms recorded in B-004.
+
+| build | shadows | prepass | frame (µs), run 1 | frame (µs), run 2 | gpu opaque (µs), run 1 | gpu opaque (µs), run 2 | cull (µs, CPU) | drawn |
+|---|---|---|---:|---:|---:|---:|---:|---:|
+| original | on | n/a | 71,072 | 70,329 | 41,949 | 41,636 | 191 to 214 | 5,068 |
+| original | off | n/a | 39,143 | 41,767 | 33,460 | 35,478 | 214 to 223 | 5,068 |
+| new | on | on | 94,033 | 80,796 | 45,174 | 37,839 | 729 to 779 | 5,068 |
+| new | off | on | 61,628 | 63,936 | 37,202 | 38,558 | 720 to 729 | 5,068 |
+| new | off | off | 61,050 | 57,739 | 54,112 | 51,138 | 719 to 740 | 5,068 |
+| new | on | off | 93,185 | 94,059 | 62,918 | 63,424 | 719 to 740 | 5,068 |
+
+What it shows:
+- The GPU culling matches the CPU culling: 5,068 instances drawn in every row, the same count as B-004 for the same camera.
+- With shadows off, the new renderer is about 50 percent slower per frame than the original on lavapipe (62 to 64 ms against 39 to 42 ms). This is a regression on this host, not a speed-up.
+- The depth prepass is close to neutral on this scene. Without it, the opaque pass takes about 52 to 54 ms, against about 37 to 39 ms with it, but the total frame changes by about 3 ms. So the prepass pays for its extra geometry pass on this scene, and it's kept because its saving grows with shading cost.
+- Shadows cost about 20 to 30 ms per frame in the new renderer on lavapipe. The shadow pass now draws every caster inside the light frustum, not only the ones the camera sees. That is the correctness fix, and its cost on this scene has not been split out by pass.
+- The CPU cull time rose from about 200 µs to about 730 µs, because the new path uploads all 10,000 instances as 96-byte records every frame, instead of culling on the CPU first.
+
+What it does not show:
+- Whether GPU-driven culling is faster than CPU culling on a real GPU. On lavapipe the culling compute runs on the same CPU as everything else, so the trade-off cannot be measured here. The CPU saving is expected to matter only at object counts far above 10,000.
+- The visual quality of PBR on a real display. The showcase frame was checked on lavapipe and looks correct; the metallic setting of the sphere (0.9) is a judgement call.
+
+Compared with: B-004 (same scene and flags, earlier host state, not comparable in absolute terms). Its batched, culling-on row is the nearest comparison for the culling count only.
+
+## B-018: two-phase Hi-Z occlusion and discrete LOD (lavapipe)
+
+Code state: the renderer pass that adds the depth pyramid (HZB), two-phase occlusion culling (`cull`, `depth`, `hzb`, `cull2`, `depth2`), and per-instance LOD selection in the cull shader. The showcase's sphere has four levels (256x128, 128x64, 48x24, 16x8 tessellation).
+
+Environment: as B-017. Same session, lavapipe, 800x600 default window for the benchmark, 1024x640 for the showcase captures.
+
+Occlusion, with a wall: `render-bench --scenario dense --count 10000 --cull on --wall on --sync on --frames 200`, one run each, occlusion on and off. The wall is one 120 x 40 slab placed between the camera and the grid, so most of the grid is hidden behind it.
+
+| occlusion | drawn (last frame) | gpu opaque (µs) | frame (µs) |
+|---|---:|---:|---:|
+| on | 418 | 24,249 | 66,419 |
+| off | 5,069 | 39,246 | 91,069 |
+
+Occlusion, without the wall (same command without `--wall`): drawn 5,068 in both settings, frame 88 to 90 ms with occlusion on, 87 ms with it off, in two runs each. The dense grid is a flat sheet of small cubes that barely hide each other, so there is little to cull. This row confirms the feature costs nothing measurable when it doesn't help.
+
+Correctness, by image: the showcase was captured with `--still on` (the sphere's rotation frozen) and occlusion on and off. The two frames are pixel-identical: 0 differing pixels out of 1,024,000.
+
+What it shows:
+- The occlusion culls what the depth buffer says is hidden. With a large occluder, 92 percent of the instances are removed before the opaque pass.
+- Image output is unchanged, for the scene tested.
+
+What it does not show:
+- Anything about a real GPU. On lavapipe the culling compute runs on the CPU, so the saving in GPU time here is a CPU saving too.
+- LOD cost or quality, separately. The showcase frame looks right with LOD selected, but no per-LOD triangle counts were recorded, so the LOD effect on time is not measured.
+- Resizing the window. The HZB and its bind groups are rebuilt on resize, but no test exercises that path.
+- Temporal behaviour when the camera moves. The two-phase design should draw newly visible objects in phase two, but a moving camera was not captured, so popping is not ruled out.
+
+Compared with: B-017, same flags with the wall added. The no-wall dense rows match B-017's new-renderer rows within run-to-run spread.

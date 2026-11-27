@@ -32,8 +32,8 @@ pub enum LightPath {
     Direct,
     Clustered,
 }
-const CLUSTER_BLOCK: &str = "    let cluster = cluster_index(input.clip.xy, input.depth);\n    let range = cluster_ranges[cluster];\n    for (var k = 0u; k < range.y; k++) {\n        let light = lights[light_indices[range.x + k]];\n        direct = direct + shade(light, n, input.world);\n    }";
-const DIRECT_BLOCK: &str = "    for (var k = 0u; k < u32(frame.viewport.w); k++) {\n        direct = direct + shade(lights[k], n, input.world);\n    }";
+const CLUSTER_BLOCK: &str = "    let cluster = cluster_index(input.clip.xy, input.depth);\n    let range = cluster_ranges[cluster];\n    for (var k = 0u; k < range.y; k++) {\n        let light = lights[light_indices[range.x + k]];\n        direct = direct + shade(light, surf);\n    }";
+const DIRECT_BLOCK: &str = "    for (var k = 0u; k < u32(frame.viewport.w); k++) {\n        direct = direct + shade(lights[k], surf);\n    }";
 
 pub(crate) fn direct_source(clustered: &str) -> Result<String, String> {
     if !clustered.contains(CLUSTER_BLOCK) {
@@ -42,25 +42,47 @@ pub(crate) fn direct_source(clustered: &str) -> Result<String, String> {
     Ok(clustered.replace(CLUSTER_BLOCK, DIRECT_BLOCK))
 }
 const VERTEX_BYTES: u64 = 24;
-const INSTANCE_BYTES: u64 = 80;
+pub(crate) const INSTANCE_BYTES: u64 = 96;
+const CULL_PARAM_BYTES: u64 = 128;
+pub(crate) const MAX_LODS: usize = 4;
+pub(crate) const ARGS_BYTES: u64 = 20;
+const SLOT_ARGS_BYTES: u64 = ARGS_BYTES * MAX_LODS as u64;
+const CAMERA_BYTES: u64 = 160;
+const LOD_PIXELS: [f32; 3] = [200.0, 80.0, 30.0];
+const HZB_L0_SOURCE: &str = include_str!("../shaders/hzb_l0.wgsl");
+const HZB_DOWN_SOURCE: &str = include_str!("../shaders/hzb_down.wgsl");
+const WORKGROUP_SIZE: u32 = 64;
+const DEFAULT_MATERIAL: [f32; 4] = [0.0, 0.5, 0.0, 0.0];
+const PASS_ALL: [[f32; 4]; 6] = [[0.0, 0.0, 0.0, 1.0]; 6];
+const CULL_SOURCE: &str = include_str!("../shaders/cull.wgsl");
+const DEPTH_SOURCE: &str = include_str!("../shaders/depth.wgsl");
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DrawInstance {
     pub model: Mat4,
     pub color: [f32; 4],
+    pub material: [f32; 4],
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DrawMode {
-    Batched,
-    Unbatched,
+impl DrawInstance {
+    pub fn new(model: Mat4, color: [f32; 4]) -> Self {
+        Self {
+            model,
+            color,
+            material: DEFAULT_MATERIAL,
+        }
+    }
+
+    pub fn with_material(mut self, metallic: f32, roughness: f32) -> Self {
+        self.material = [metallic, roughness, 0.0, 0.0];
+        self
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FrameStats {
     pub submitted: usize,
-    pub drawn: u32,
     pub cull: Duration,
     pub lights: usize,
     pub lights_dropped: usize,
@@ -87,10 +109,14 @@ impl fmt::Display for RenderError {
 
 impl std::error::Error for RenderError {}
 
-pub(crate) struct GpuMesh {
+pub(crate) struct GpuLod {
     pub(crate) vertices: wgpu::Buffer,
     pub(crate) indices: wgpu::Buffer,
     pub(crate) index_count: u32,
+}
+
+pub(crate) struct GpuMesh {
+    pub(crate) lods: Vec<GpuLod>,
     pub(crate) radius: f32,
 }
 
@@ -112,6 +138,37 @@ pub(crate) struct BatchDraw {
     pub(crate) count: u32,
 }
 
+pub(crate) struct BatchSlot {
+    pub(crate) params: [wgpu::Buffer; 3],
+    pub(crate) args: [wgpu::Buffer; 3],
+}
+
+impl BatchSlot {
+    fn new(device: &wgpu::Device) -> Self {
+        Self {
+            params: [
+                create_uniform(device, CULL_PARAM_BYTES, "cull params"),
+                create_uniform(device, CULL_PARAM_BYTES, "cull params phase 2"),
+                create_uniform(device, CULL_PARAM_BYTES, "shadow cull params"),
+            ],
+            args: [
+                create_args(device),
+                create_args(device),
+                create_args(device),
+            ],
+        }
+    }
+}
+
+pub(crate) struct Hzb {
+    _texture: wgpu::Texture,
+    pub(crate) all: wgpu::TextureView,
+    pub(crate) levels: u32,
+    pub(crate) dims: Vec<(u32, u32)>,
+    pub(crate) l0: wgpu::BindGroup,
+    pub(crate) down: Vec<wgpu::BindGroup>,
+}
+
 pub(crate) struct DrawResources {
     pub(crate) shadow_pipeline: wgpu::RenderPipeline,
     pub(crate) shadow_bind_group: wgpu::BindGroup,
@@ -121,6 +178,7 @@ pub(crate) struct DrawResources {
     pub(crate) shadows_enabled: bool,
     pub(crate) pipeline: wgpu::RenderPipeline,
     pub(crate) direct: wgpu::RenderPipeline,
+    pub(crate) depth_pipeline: wgpu::RenderPipeline,
     pub(crate) use_direct: bool,
     pub(crate) bind_layout: wgpu::BindGroupLayout,
     pub(crate) bind_group: wgpu::BindGroup,
@@ -131,10 +189,27 @@ pub(crate) struct DrawResources {
     pub(crate) ranges: wgpu::Buffer,
     pub(crate) meshes: Vec<GpuMesh>,
     pub(crate) batches: Vec<BatchDraw>,
-    pub(crate) instances: wgpu::Buffer,
-    pub(crate) instance_capacity: usize,
-    pub(crate) instance_count: u32,
-    pub(crate) unbatched: bool,
+    pub(crate) groups: Vec<u32>,
+    pub(crate) cull_layout: wgpu::BindGroupLayout,
+    pub(crate) cull_pipeline: wgpu::ComputePipeline,
+    pub(crate) hzb_l0_layout: wgpu::BindGroupLayout,
+    pub(crate) hzb_down_layout: wgpu::BindGroupLayout,
+    pub(crate) hzb_l0_pipeline: wgpu::ComputePipeline,
+    pub(crate) hzb_down_pipeline: wgpu::ComputePipeline,
+    pub(crate) hzb: Hzb,
+    pub(crate) camera_ubo: wgpu::Buffer,
+    pub(crate) raw_instances: wgpu::Buffer,
+    pub(crate) flags: wgpu::Buffer,
+    pub(crate) camera_compact: wgpu::Buffer,
+    pub(crate) camera_compact2: wgpu::Buffer,
+    pub(crate) shadow_compact: wgpu::Buffer,
+    pub(crate) capacity: usize,
+    pub(crate) slots: Vec<BatchSlot>,
+    pub(crate) binds: Vec<[wgpu::BindGroup; 3]>,
+    pub(crate) binds_valid: bool,
+    pub(crate) build_hzb: bool,
+    pub(crate) occlusion_active: bool,
+    pub(crate) hzb_ready: bool,
 }
 
 pub struct Renderer {
@@ -148,8 +223,8 @@ pub struct Renderer {
     draws: DrawResources,
     shader: ShaderState,
     scratch: Vec<u8>,
-    visible: Vec<DrawInstance>,
     culling: bool,
+    occlusion: bool,
     storage_lights: Vec<Light>,
     clusters: ClusterData,
     light_path: LightPath,
@@ -158,7 +233,15 @@ pub struct Renderer {
 
 impl Renderer {
     pub fn add_mesh(&mut self, mesh: &Mesh) -> MeshHandle {
-        self.draws.meshes.push(upload_mesh(&self.device, mesh));
+        self.add_mesh_lods(std::slice::from_ref(mesh))
+    }
+
+    pub fn add_mesh_lods(&mut self, lods: &[Mesh]) -> MeshHandle {
+        assert!(
+            !lods.is_empty() && lods.len() <= MAX_LODS,
+            "a mesh needs between 1 and {MAX_LODS} levels of detail"
+        );
+        self.draws.meshes.push(upload_mesh(&self.device, lods));
         MeshHandle(self.draws.meshes.len() - 1)
     }
 }
@@ -201,7 +284,8 @@ impl Renderer {
         surface.configure(&device, &config);
 
         let depth = create_depth(&device, config.width, config.height);
-        let (draws, shader) = DrawResources::new(&device, config.format);
+        let (draws, shader) =
+            DrawResources::new(&device, config.format, config.width, config.height, &depth);
         let graph = RenderGraph::new(default_passes()).expect("the default passes are valid");
         let gpu_timer =
             timestamps_supported.then(|| GpuTimer::new(&device, &queue, graph.slot_count()));
@@ -217,8 +301,8 @@ impl Renderer {
             draws,
             shader,
             scratch: Vec::new(),
-            visible: Vec::new(),
             culling: false,
+            occlusion: true,
             storage_lights: Vec::new(),
             clusters: ClusterData::default(),
             light_path: LightPath::Auto,
@@ -234,10 +318,76 @@ impl Renderer {
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
         self.depth = create_depth(&self.device, width, height);
+        self.draws.hzb = create_hzb(
+            &self.device,
+            width,
+            height,
+            &self.depth,
+            &self.draws.hzb_l0_layout,
+            &self.draws.hzb_down_layout,
+        );
+        self.draws.hzb_ready = false;
+        self.draws.binds_valid = false;
     }
 
-    pub fn set_draw_mode(&mut self, mode: DrawMode) {
-        self.draws.unbatched = mode == DrawMode::Unbatched;
+    pub fn visible_counts(&self) -> Vec<u32> {
+        let count = self.draws.batches.len();
+        if count == 0 {
+            return Vec::new();
+        }
+        let words = 2 * MAX_LODS;
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("visible counts"),
+            size: (count * words * 4) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("visible counts"),
+            });
+        for (index, slot) in self.draws.slots.iter().take(count).enumerate() {
+            for phase in 0..2 {
+                for lod in 0..MAX_LODS {
+                    let word = index * words + phase * MAX_LODS + lod;
+                    encoder.copy_buffer_to_buffer(
+                        &slot.args[phase],
+                        lod as u64 * ARGS_BYTES + 4,
+                        &staging,
+                        word as u64 * 4,
+                        4,
+                    );
+                }
+            }
+        }
+        self.queue.submit(Some(encoder.finish()));
+        let (sender, receiver) = std::sync::mpsc::channel();
+        staging
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let _ = sender.send(result);
+            });
+        self.wait_idle();
+        if !matches!(receiver.recv(), Ok(Ok(()))) {
+            return Vec::new();
+        }
+        let counts: Vec<u32> = {
+            let Ok(data) = staging.slice(..).get_mapped_range() else {
+                staging.unmap();
+                return Vec::new();
+            };
+            data.chunks_exact(words * 4)
+                .map(|batch| {
+                    batch
+                        .chunks_exact(4)
+                        .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                        .sum()
+                })
+                .collect()
+        };
+        staging.unmap();
+        counts
     }
 
     pub fn set_shadows(&mut self, enabled: bool) {
@@ -250,6 +400,10 @@ impl Renderer {
 
     pub fn set_culling(&mut self, enabled: bool) {
         self.culling = enabled;
+    }
+
+    pub fn set_occlusion_culling(&mut self, enabled: bool) {
+        self.occlusion = enabled;
     }
 
     pub fn use_shader_file(&mut self, path: impl AsRef<Path>) -> Result<ShaderUpdate, ShaderError> {
@@ -295,6 +449,8 @@ impl Renderer {
             &self.shader.layout,
             self.shader.format,
             &direct_text,
+            false,
+            wgpu::CompareFunction::LessEqual,
         ) {
             Ok(direct) => direct,
             Err(message) => {
@@ -309,7 +465,14 @@ impl Renderer {
             self.shader.last_error = None;
             return Ok(ShaderUpdate::FromCache);
         }
-        match build_pipeline(&self.device, &self.shader.layout, self.shader.format, text) {
+        match build_pipeline(
+            &self.device,
+            &self.shader.layout,
+            self.shader.format,
+            text,
+            false,
+            wgpu::CompareFunction::LessEqual,
+        ) {
             Ok(pipeline) => {
                 self.shader.remember(hash, pipeline.clone());
                 self.draws.pipeline = pipeline;
@@ -337,7 +500,6 @@ impl Renderer {
         let dropped_before_upload = lights.len().saturating_sub(total_lights);
         let stats_for_skip = |cull: Duration| FrameStats {
             submitted,
-            drawn: 0,
             cull,
             lights: total_lights,
             lights_dropped: dropped_before_upload,
@@ -433,28 +595,32 @@ impl Renderer {
             .write_buffer(&self.draws.uniform, 0, &self.scratch);
         self.upload_lights();
 
-        self.visible.clear();
-        self.draws.batches.clear();
-        let mut cull = Duration::ZERO;
-        for batch in batches {
-            let mesh = batch.mesh.0;
-            let radius = self.draws.meshes[mesh].radius;
-            let first = self.visible.len();
-            if self.culling {
-                let start = Instant::now();
-                cull_append(&mut self.visible, batch.instances, view_proj, radius);
-                cull += start.elapsed();
+        let cull_start = Instant::now();
+        self.draws.occlusion_active = self.occlusion && self.culling && self.draws.hzb_ready;
+        self.draws.build_hzb = self.culling;
+        let camera_planes = self.plane_set(view_proj);
+        let shadow_planes = shadows_enabled.then(|| self.plane_set(shadow_view_proj));
+        let camera_screen = [
+            self.config.width as f32,
+            self.config.height as f32,
+            self.draws.hzb.levels as f32,
+            if self.draws.occlusion_active {
+                1.0
             } else {
-                self.visible.extend_from_slice(batch.instances);
-            }
-            let count = self.visible.len() - first;
-            self.draws.batches.push(BatchDraw {
-                mesh,
-                first: u32::try_from(first).unwrap_or(u32::MAX),
-                count: u32::try_from(count).unwrap_or(u32::MAX),
-            });
-        }
-        self.upload_instances();
+                0.0
+            },
+        ];
+        let camera_lods = [LOD_PIXELS[0], LOD_PIXELS[1], LOD_PIXELS[2], camera.near];
+        let camera_data = camera_bytes(
+            camera.view(),
+            camera.projection(aspect),
+            camera_screen,
+            camera_lods,
+        );
+        self.queue
+            .write_buffer(&self.draws.camera_ubo, 0, &camera_data);
+        self.upload_batches(batches, camera_planes, shadow_planes);
+        let cull = cull_start.elapsed();
 
         let mut encoder = self
             .device
@@ -485,13 +651,13 @@ impl Renderer {
             timer.finish_frame(&mut encoder);
         }
         self.queue.submit(Some(encoder.finish()));
+        self.draws.hzb_ready = self.culling;
         if timing_frame && let Some(timer) = self.gpu_timer.as_mut() {
             timer.map_after_submit();
         }
         self.queue.present(frame);
         Ok(FrameStats {
             submitted,
-            drawn: self.draws.instance_count,
             cull,
             lights: light_total,
             lights_dropped: light_dropped,
@@ -572,24 +738,483 @@ impl Renderer {
         }
     }
 
-    fn upload_instances(&mut self) {
-        let needed = self.visible.len().max(1);
-        if needed > self.draws.instance_capacity {
-            let capacity = needed.next_power_of_two();
-            self.draws.instances = create_instance_buffer(&self.device, capacity);
-            self.draws.instance_capacity = capacity;
+    fn plane_set(&self, view_proj: Mat4) -> [[f32; 4]; 6] {
+        if self.culling {
+            frustum_planes(view_proj).map(|plane| plane.to_array())
+        } else {
+            PASS_ALL
         }
+    }
+
+    fn upload_batches(
+        &mut self,
+        batches: &[Batch<'_>],
+        camera: [[f32; 4]; 6],
+        shadow: Option<[[f32; 4]; 6]>,
+    ) {
+        let total: usize = batches.iter().map(|batch| batch.instances.len()).sum();
         self.scratch.clear();
-        for instance in &self.visible {
-            push_floats(&mut self.scratch, &instance.model.to_cols_array());
-            push_floats(&mut self.scratch, &instance.color);
+        self.draws.batches.clear();
+        self.draws.groups.clear();
+        let mut first = 0usize;
+        for batch in batches {
+            for instance in batch.instances {
+                push_instance(&mut self.scratch, instance);
+            }
+            let count = u32::try_from(batch.instances.len()).unwrap_or(u32::MAX);
+            self.draws.batches.push(BatchDraw {
+                mesh: batch.mesh.0,
+                first: u32::try_from(first).unwrap_or(u32::MAX),
+                count,
+            });
+            self.draws.groups.push(count.div_ceil(WORKGROUP_SIZE));
+            first += batch.instances.len();
+        }
+        if total > self.draws.capacity {
+            self.draws.capacity = total.max(1).next_power_of_two();
+            self.draws.raw_instances = create_instance_buffer(&self.device, self.draws.capacity);
+            self.draws.camera_compact =
+                create_compact_buffer(&self.device, self.draws.capacity * MAX_LODS);
+            self.draws.camera_compact2 =
+                create_compact_buffer(&self.device, self.draws.capacity * MAX_LODS);
+            self.draws.shadow_compact =
+                create_compact_buffer(&self.device, self.draws.capacity * MAX_LODS);
+            self.draws.flags =
+                create_storage(&self.device, self.draws.capacity as u64 * 4, "flags");
+            self.draws.binds_valid = false;
         }
         if !self.scratch.is_empty() {
             self.queue
-                .write_buffer(&self.draws.instances, 0, &self.scratch);
+                .write_buffer(&self.draws.raw_instances, 0, &self.scratch);
         }
-        self.draws.instance_count = u32::try_from(self.visible.len()).unwrap_or(u32::MAX);
+        while self.draws.slots.len() < batches.len() {
+            self.draws.slots.push(BatchSlot::new(&self.device));
+        }
+        let capacity = u32::try_from(self.draws.capacity).unwrap_or(u32::MAX);
+        let phase1 = u32::from(self.draws.occlusion_active);
+        for (index, batch) in self.draws.batches.iter().enumerate() {
+            let slot = &self.draws.slots[index];
+            let mesh = &self.draws.meshes[batch.mesh];
+            let lod_count = u32::try_from(mesh.lods.len()).unwrap_or(1);
+            let radius = mesh.radius;
+            let args = lod_args_bytes(mesh.lods.iter().map(|lod| lod.index_count));
+            let (first, count) = (batch.first, batch.count);
+            self.queue.write_buffer(
+                &slot.params[0],
+                0,
+                &cull_params_bytes(camera, first, count, lod_count, phase1, capacity, radius),
+            );
+            self.queue.write_buffer(
+                &slot.params[1],
+                0,
+                &cull_params_bytes(camera, first, count, lod_count, 2, capacity, radius),
+            );
+            self.queue.write_buffer(
+                &slot.params[2],
+                0,
+                &cull_params_bytes(
+                    shadow.unwrap_or(camera),
+                    first,
+                    count,
+                    lod_count,
+                    0,
+                    capacity,
+                    radius,
+                ),
+            );
+            for args_buffer in &slot.args {
+                self.queue.write_buffer(args_buffer, 0, &args);
+            }
+        }
+        if !self.draws.binds_valid || self.draws.binds.len() != self.draws.slots.len() {
+            self.draws.binds.clear();
+            let hzb = &self.draws.hzb.all;
+            for slot in &self.draws.slots {
+                let phase_one = make_cull_bind(
+                    &self.device,
+                    &self.draws.cull_layout,
+                    &CullBinding {
+                        params: &slot.params[0],
+                        raw: &self.draws.raw_instances,
+                        out: &self.draws.camera_compact,
+                        args: &slot.args[0],
+                        flags: &self.draws.flags,
+                        camera: &self.draws.camera_ubo,
+                        hzb,
+                    },
+                );
+                let phase_two = make_cull_bind(
+                    &self.device,
+                    &self.draws.cull_layout,
+                    &CullBinding {
+                        params: &slot.params[1],
+                        raw: &self.draws.raw_instances,
+                        out: &self.draws.camera_compact2,
+                        args: &slot.args[1],
+                        flags: &self.draws.flags,
+                        camera: &self.draws.camera_ubo,
+                        hzb,
+                    },
+                );
+                let shadow_bind = make_cull_bind(
+                    &self.device,
+                    &self.draws.cull_layout,
+                    &CullBinding {
+                        params: &slot.params[2],
+                        raw: &self.draws.raw_instances,
+                        out: &self.draws.shadow_compact,
+                        args: &slot.args[2],
+                        flags: &self.draws.flags,
+                        camera: &self.draws.camera_ubo,
+                        hzb,
+                    },
+                );
+                self.draws.binds.push([phase_one, phase_two, shadow_bind]);
+            }
+            self.draws.binds_valid = true;
+        }
     }
+}
+
+fn push_instance(out: &mut Vec<u8>, instance: &DrawInstance) {
+    push_floats(out, &instance.model.to_cols_array());
+    push_floats(out, &instance.color);
+    push_floats(out, &instance.material);
+}
+
+fn cull_params_bytes(
+    planes: [[f32; 4]; 6],
+    first: u32,
+    count: u32,
+    lod_count: u32,
+    phase: u32,
+    capacity: u32,
+    radius: f32,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(CULL_PARAM_BYTES as usize);
+    for plane in planes {
+        push_floats(&mut out, &plane);
+    }
+    for value in [first, count, lod_count, phase, capacity] {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    out.extend_from_slice(&radius.to_le_bytes());
+    out.extend_from_slice(&[0u8; 8]);
+    out
+}
+
+fn camera_bytes(view: Mat4, projection: Mat4, screen: [f32; 4], lods: [f32; 4]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(CAMERA_BYTES as usize);
+    push_floats(&mut out, &view.to_cols_array());
+    push_floats(&mut out, &projection.to_cols_array());
+    push_floats(&mut out, &screen);
+    push_floats(&mut out, &lods);
+    out
+}
+
+fn lod_args_bytes(index_counts: impl Iterator<Item = u32>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(SLOT_ARGS_BYTES as usize);
+    let mut counts = index_counts;
+    for _ in 0..MAX_LODS {
+        let index_count = counts.next().unwrap_or(0);
+        for value in [index_count, 0, 0, 0, 0] {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    out
+}
+
+fn cull_bind_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    let buffer = |binding: u32, ty: wgpu::BufferBindingType| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty,
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    };
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("cull"),
+        entries: &[
+            buffer(0, wgpu::BufferBindingType::Uniform),
+            buffer(1, wgpu::BufferBindingType::Storage { read_only: true }),
+            buffer(2, wgpu::BufferBindingType::Storage { read_only: false }),
+            buffer(3, wgpu::BufferBindingType::Storage { read_only: false }),
+            buffer(4, wgpu::BufferBindingType::Storage { read_only: false }),
+            buffer(5, wgpu::BufferBindingType::Uniform),
+            wgpu::BindGroupLayoutEntry {
+                binding: 6,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+        ],
+    })
+}
+
+fn hzb_layout(device: &wgpu::Device, label: &str, depth: bool) -> wgpu::BindGroupLayout {
+    let sample_type = if depth {
+        wgpu::TextureSampleType::Depth
+    } else {
+        wgpu::TextureSampleType::Float { filterable: false }
+    };
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some(label),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Texture {
+                    sample_type,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::StorageTexture {
+                    access: wgpu::StorageTextureAccess::WriteOnly,
+                    format: wgpu::TextureFormat::R32Float,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                },
+                count: None,
+            },
+        ],
+    })
+}
+
+fn build_compute(
+    device: &wgpu::Device,
+    label: &str,
+    layout: &wgpu::BindGroupLayout,
+    source: &str,
+    entry: &str,
+) -> wgpu::ComputePipeline {
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some(label),
+        bind_group_layouts: &[Some(layout)],
+        immediate_size: 0,
+    });
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some(label),
+        source: wgpu::ShaderSource::Wgsl(source.into()),
+    });
+    device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some(label),
+        layout: Some(&pipeline_layout),
+        module: &module,
+        entry_point: Some(entry),
+        compilation_options: Default::default(),
+        cache: None,
+    })
+}
+
+fn create_hzb(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+    depth: &wgpu::TextureView,
+    l0_layout: &wgpu::BindGroupLayout,
+    down_layout: &wgpu::BindGroupLayout,
+) -> Hzb {
+    let width = width.max(1);
+    let height = height.max(1);
+    let levels = 32 - width.max(height).leading_zeros();
+    let mut dims = Vec::with_capacity(levels as usize);
+    let (mut w, mut h) = (width, height);
+    for _ in 0..levels {
+        dims.push((w, h));
+        w = w.div_ceil(2);
+        h = h.div_ceil(2);
+    }
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("hzb"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: levels,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::R32Float,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
+        view_formats: &[],
+    });
+    let level_view = |mip: u32| {
+        texture.create_view(&wgpu::TextureViewDescriptor {
+            base_mip_level: mip,
+            mip_level_count: Some(1),
+            ..Default::default()
+        })
+    };
+    let all = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let l0 = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("hzb level 0"),
+        layout: l0_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(depth),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(&level_view(0)),
+            },
+        ],
+    });
+    let down = (1..levels)
+        .map(|mip| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("hzb down"),
+                layout: down_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&level_view(mip - 1)),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&level_view(mip)),
+                    },
+                ],
+            })
+        })
+        .collect();
+    Hzb {
+        _texture: texture,
+        all,
+        levels,
+        dims,
+        l0,
+        down,
+    }
+}
+
+fn build_cull_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+) -> wgpu::ComputePipeline {
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("cull"),
+        bind_group_layouts: &[Some(layout)],
+        immediate_size: 0,
+    });
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("cull"),
+        source: wgpu::ShaderSource::Wgsl(CULL_SOURCE.into()),
+    });
+    device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("cull"),
+        layout: Some(&pipeline_layout),
+        module: &module,
+        entry_point: Some("cull_main"),
+        compilation_options: Default::default(),
+        cache: None,
+    })
+}
+
+struct CullBinding<'a> {
+    params: &'a wgpu::Buffer,
+    raw: &'a wgpu::Buffer,
+    out: &'a wgpu::Buffer,
+    args: &'a wgpu::Buffer,
+    flags: &'a wgpu::Buffer,
+    camera: &'a wgpu::Buffer,
+    hzb: &'a wgpu::TextureView,
+}
+
+fn make_cull_bind(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    binding: &CullBinding<'_>,
+) -> wgpu::BindGroup {
+    let entries = [
+        wgpu::BindGroupEntry {
+            binding: 0,
+            resource: binding.params.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+            binding: 1,
+            resource: binding.raw.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+            binding: 2,
+            resource: binding.out.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+            binding: 3,
+            resource: binding.args.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+            binding: 4,
+            resource: binding.flags.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+            binding: 5,
+            resource: binding.camera.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+            binding: 6,
+            resource: wgpu::BindingResource::TextureView(binding.hzb),
+        },
+    ];
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("cull"),
+        layout,
+        entries: &entries,
+    })
+}
+
+fn build_depth_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+) -> wgpu::RenderPipeline {
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("depth prepass"),
+        source: wgpu::ShaderSource::Wgsl(DEPTH_SOURCE.into()),
+    });
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("depth prepass"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: &module,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[
+                Some(wgpu::VertexBufferLayout {
+                    array_stride: VERTEX_BYTES,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &VERTEX_ATTRIBUTES,
+                }),
+                Some(wgpu::VertexBufferLayout {
+                    array_stride: INSTANCE_BYTES,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &INSTANCE_ATTRIBUTES,
+                }),
+            ],
+        },
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(wgpu::CompareFunction::Less),
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        fragment: None,
+        multiview_mask: None,
+        cache: None,
+    })
 }
 
 pub(crate) fn classify(
@@ -617,6 +1242,7 @@ pub(crate) fn classify(
     (directional_count, dropped)
 }
 
+#[cfg(test)]
 pub(crate) fn cull_append(
     out: &mut Vec<DrawInstance>,
     instances: &[DrawInstance],
@@ -656,7 +1282,13 @@ pub(crate) fn frustum_planes(view_proj: Mat4) -> [Vec4; 6] {
 }
 
 impl DrawResources {
-    fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> (Self, ShaderState) {
+    fn new(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        width: u32,
+        height: u32,
+        depth: &wgpu::TextureView,
+    ) -> (Self, ShaderState) {
         let storage = |binding: u32| wgpu::BindGroupLayoutEntry {
             binding,
             visibility: wgpu::ShaderStages::FRAGMENT,
@@ -706,12 +1338,29 @@ impl DrawResources {
             bind_group_layouts: &[Some(&bind_layout)],
             immediate_size: 0,
         });
-        let pipeline = build_pipeline(device, &pipeline_layout, format, EMBEDDED_CUBE)
-            .expect("the embedded cube shader compiles");
+        let pipeline = build_pipeline(
+            device,
+            &pipeline_layout,
+            format,
+            EMBEDDED_CUBE,
+            false,
+            wgpu::CompareFunction::LessEqual,
+        )
+        .expect("the embedded cube shader compiles");
         let direct_text =
             direct_source(EMBEDDED_CUBE).expect("the embedded shader has the cluster block");
-        let direct = build_pipeline(device, &pipeline_layout, format, &direct_text)
-            .expect("the direct cube shader compiles");
+        let direct = build_pipeline(
+            device,
+            &pipeline_layout,
+            format,
+            &direct_text,
+            false,
+            wgpu::CompareFunction::LessEqual,
+        )
+        .expect("the direct cube shader compiles");
+        let depth_pipeline = build_depth_pipeline(device, &pipeline_layout);
+        let cull_layout = cull_bind_layout(device);
+        let cull_pipeline = build_cull_pipeline(device, &cull_layout);
 
         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("frame uniform"),
@@ -840,8 +1489,33 @@ impl DrawResources {
             cache: None,
         });
 
-        let cube_mesh = upload_mesh(device, &cube());
+        let cube_mesh = upload_mesh(device, &[cube()]);
 
+        let hzb_l0_layout = hzb_layout(device, "hzb level 0", true);
+        let hzb_down_layout = hzb_layout(device, "hzb down", false);
+        let hzb_l0_pipeline = build_compute(
+            device,
+            "hzb level 0",
+            &hzb_l0_layout,
+            HZB_L0_SOURCE,
+            "hzb_l0",
+        );
+        let hzb_down_pipeline = build_compute(
+            device,
+            "hzb down",
+            &hzb_down_layout,
+            HZB_DOWN_SOURCE,
+            "hzb_down",
+        );
+        let hzb = create_hzb(
+            device,
+            width,
+            height,
+            depth,
+            &hzb_l0_layout,
+            &hzb_down_layout,
+        );
+        let camera_ubo = create_uniform(device, CAMERA_BYTES, "camera occlusion");
         let instance_capacity = 64;
         let mut shader = ShaderState::new(pipeline_layout, format);
         shader.remember(shader.active, pipeline.clone());
@@ -854,6 +1528,7 @@ impl DrawResources {
             shadows_enabled: false,
             pipeline,
             direct,
+            depth_pipeline,
             use_direct: false,
             bind_layout,
             bind_group,
@@ -864,10 +1539,27 @@ impl DrawResources {
             ranges,
             meshes: vec![cube_mesh],
             batches: Vec::new(),
-            instances: create_instance_buffer(device, instance_capacity),
-            instance_capacity,
-            instance_count: 0,
-            unbatched: false,
+            groups: Vec::new(),
+            cull_layout,
+            cull_pipeline,
+            hzb_l0_layout,
+            hzb_down_layout,
+            hzb_l0_pipeline,
+            hzb_down_pipeline,
+            hzb,
+            camera_ubo,
+            raw_instances: create_instance_buffer(device, instance_capacity),
+            flags: create_storage(device, instance_capacity as u64 * 4, "flags"),
+            camera_compact: create_compact_buffer(device, instance_capacity * MAX_LODS),
+            camera_compact2: create_compact_buffer(device, instance_capacity * MAX_LODS),
+            shadow_compact: create_compact_buffer(device, instance_capacity * MAX_LODS),
+            capacity: instance_capacity,
+            slots: Vec::new(),
+            binds: Vec::new(),
+            binds_valid: false,
+            build_hzb: false,
+            occlusion_active: false,
+            hzb_ready: false,
         };
         (draws, shader)
     }
@@ -937,7 +1629,7 @@ const VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 2] = [
         shader_location: 1,
     },
 ];
-const INSTANCE_ATTRIBUTES: [wgpu::VertexAttribute; 5] = [
+const INSTANCE_ATTRIBUTES: [wgpu::VertexAttribute; 6] = [
     wgpu::VertexAttribute {
         format: wgpu::VertexFormat::Float32x4,
         offset: 0,
@@ -963,6 +1655,11 @@ const INSTANCE_ATTRIBUTES: [wgpu::VertexAttribute; 5] = [
         offset: 64,
         shader_location: 7,
     },
+    wgpu::VertexAttribute {
+        format: wgpu::VertexFormat::Float32x4,
+        offset: 80,
+        shader_location: 8,
+    },
 ];
 
 pub(crate) fn build_pipeline(
@@ -970,6 +1667,8 @@ pub(crate) fn build_pipeline(
     layout: &wgpu::PipelineLayout,
     format: wgpu::TextureFormat,
     source: &str,
+    depth_write: bool,
+    depth_compare: wgpu::CompareFunction,
 ) -> Result<wgpu::RenderPipeline, String> {
     let guard = device.push_error_scope(wgpu::ErrorFilter::Validation);
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -999,8 +1698,8 @@ pub(crate) fn build_pipeline(
         primitive: wgpu::PrimitiveState::default(),
         depth_stencil: Some(wgpu::DepthStencilState {
             format: DEPTH_FORMAT,
-            depth_write_enabled: Some(true),
-            depth_compare: Some(wgpu::CompareFunction::Less),
+            depth_write_enabled: Some(depth_write),
+            depth_compare: Some(depth_compare),
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         }),
@@ -1050,7 +1749,15 @@ fn shadow_view_proj_bytes(matrix: Mat4) -> Vec<u8> {
     bytes
 }
 
-fn upload_mesh(device: &wgpu::Device, mesh: &Mesh) -> GpuMesh {
+fn upload_mesh(device: &wgpu::Device, lods: &[Mesh]) -> GpuMesh {
+    let uploaded = lods.iter().map(|mesh| upload_lod(device, mesh)).collect();
+    GpuMesh {
+        lods: uploaded,
+        radius: lods[0].bounding_radius,
+    }
+}
+
+fn upload_lod(device: &wgpu::Device, mesh: &Mesh) -> GpuLod {
     let mut vertex_bytes = Vec::with_capacity(mesh.vertices.len() * 24);
     for vertex in &mesh.vertices {
         push_floats(&mut vertex_bytes, &vertex.position);
@@ -1070,11 +1777,10 @@ fn upload_mesh(device: &wgpu::Device, mesh: &Mesh) -> GpuMesh {
         contents: &index_bytes,
         usage: wgpu::BufferUsages::INDEX,
     });
-    GpuMesh {
+    GpuLod {
         vertices,
         indices,
         index_count: u32::try_from(mesh.indices.len()).unwrap_or(u32::MAX),
-        radius: mesh.bounding_radius,
     }
 }
 
@@ -1082,7 +1788,37 @@ fn create_instance_buffer(device: &wgpu::Device, capacity: usize) -> wgpu::Buffe
     device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("instances"),
         size: capacity as u64 * INSTANCE_BYTES,
-        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
+fn create_compact_buffer(device: &wgpu::Device, capacity: usize) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("compacted instances"),
+        size: capacity as u64 * INSTANCE_BYTES,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    })
+}
+
+fn create_uniform(device: &wgpu::Device, size: u64, label: &'static str) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
+fn create_args(device: &wgpu::Device) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("indirect args"),
+        size: SLOT_ARGS_BYTES,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::INDIRECT
+            | wgpu::BufferUsages::COPY_SRC
+            | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     })
 }
@@ -1099,7 +1835,7 @@ fn create_depth(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: DEPTH_FORMAT,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     });
     texture.create_view(&wgpu::TextureViewDescriptor::default())
@@ -1117,14 +1853,14 @@ mod tests {
     use glam::Vec3;
 
     fn instance_at(translation: Vec3, scale: f32) -> DrawInstance {
-        DrawInstance {
-            model: Mat4::from_scale_rotation_translation(
+        DrawInstance::new(
+            Mat4::from_scale_rotation_translation(
                 Vec3::splat(scale),
                 glam::Quat::IDENTITY,
                 translation,
             ),
-            color: [1.0; 4],
-        }
+            [1.0; 4],
+        )
     }
 
     fn cull_into(out: &mut Vec<DrawInstance>, instances: &[DrawInstance], view_proj: Mat4) {
@@ -1213,6 +1949,38 @@ mod tests {
         assert_ne!(content_hash("abc"), content_hash("abd"));
         assert_eq!(content_hash(EMBEDDED_CUBE), content_hash(EMBEDDED_CUBE));
     }
+
+    #[test]
+    fn a_caster_outside_the_camera_still_casts_when_the_light_reaches_it() {
+        let light = key_shadow_matrix(Vec3::Y);
+        let caster = [instance_at(Vec3::new(0.0, 30.0, 0.0), 1.0)];
+        let mut from_camera = Vec::new();
+        cull_append(&mut from_camera, &caster, camera_matrix(), 0.866_025_4);
+        assert!(from_camera.is_empty());
+        let mut from_light = Vec::new();
+        cull_append(&mut from_light, &caster, light, 0.866_025_4);
+        assert_eq!(from_light.len(), 1);
+    }
+
+    #[test]
+    fn the_gpu_records_match_their_shader_layouts() {
+        let instance = instance_at(Vec3::ZERO, 1.0);
+        let mut bytes = Vec::new();
+        push_instance(&mut bytes, &instance);
+        assert_eq!(bytes.len() as u64, INSTANCE_BYTES);
+        assert_eq!(
+            cull_params_bytes([[0.0; 4]; 6], 0, 0, 1, 0, 1, 1.0).len() as u64,
+            CULL_PARAM_BYTES
+        );
+        assert_eq!(
+            camera_bytes(Mat4::IDENTITY, Mat4::IDENTITY, [1.0; 4], [1.0; 4]).len() as u64,
+            CAMERA_BYTES
+        );
+        assert_eq!(
+            lod_args_bytes([36u32].into_iter()).len() as u64,
+            ARGS_BYTES * MAX_LODS as u64
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1225,10 +1993,7 @@ mod batch_tests {
         let camera = crate::camera::Camera::default();
         let view_proj = camera.view_proj(16.0 / 9.0);
         let edge = Vec3::new(3.0, 0.0, 0.0);
-        let at_edge = [DrawInstance {
-            model: Mat4::from_translation(edge),
-            color: [1.0; 4],
-        }];
+        let at_edge = [DrawInstance::new(Mat4::from_translation(edge), [1.0; 4])];
         let mut small = Vec::new();
         cull_append(&mut small, &at_edge, view_proj, 0.5);
         let mut large = Vec::new();
