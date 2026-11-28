@@ -117,10 +117,7 @@ impl App {
                 &self.camera,
                 &self.lights,
                 &self.params,
-                &[Batch {
-                    mesh: CUBE,
-                    instances: &self.instances,
-                }],
+                &[Batch::new(CUBE, &self.instances)],
             )
         {
             eprintln!("{error}");

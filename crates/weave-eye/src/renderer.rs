@@ -16,7 +16,13 @@ use crate::lights::{Light, MAX_DIRECTIONAL, MAX_LIGHTS};
 use crate::mesh::{Mesh, cube};
 use crate::shader::{self, EMBEDDED_CUBE, ShaderError, ShaderState, ShaderUpdate, content_hash};
 
-const FRAME_BYTES: u64 = (16 + 16 + 4 + 4 + 4 + 16 + 4 + MAX_DIRECTIONAL as u64 * 16) * 4;
+const FRAME_BYTES: u64 =
+    (16 + 16 + 4 + 4 + 4 + 16 + 4 + MAX_DIRECTIONAL as u64 * 16 + 16 + 16 + 4 + 4 + 4) * 4;
+const AO_RADIUS: f32 = 0.9;
+const AO_BIAS: f32 = 0.03;
+const AO_STRENGTH: f32 = 2.2;
+const SKY_COLOR: [f32; 3] = [0.62, 0.70, 0.84];
+const GROUND_COLOR: [f32; 3] = [0.30, 0.27, 0.24];
 const SHADOW_SIZE: u32 = 2048;
 const SHADOW_HALF_EXTENT: f32 = 22.0;
 const SHADOW_DISTANCE: f32 = 45.0;
@@ -136,6 +142,25 @@ pub const CUBE: MeshHandle = MeshHandle(0);
 pub struct Batch<'a> {
     pub mesh: MeshHandle,
     pub instances: &'a [DrawInstance],
+    pub version: Option<u64>,
+}
+
+impl<'a> Batch<'a> {
+    pub fn new(mesh: MeshHandle, instances: &'a [DrawInstance]) -> Self {
+        Self {
+            mesh,
+            instances,
+            version: None,
+        }
+    }
+
+    pub fn versioned(mesh: MeshHandle, instances: &'a [DrawInstance], version: u64) -> Self {
+        Self {
+            mesh,
+            instances,
+            version: Some(version),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -183,6 +208,17 @@ pub(crate) struct DrawResources {
     pub(crate) shadow_view: wgpu::TextureView,
     pub(crate) shadow_sampler: wgpu::Sampler,
     pub(crate) shadows_enabled: bool,
+    pub(crate) ambient_occlusion_enabled: bool,
+    pub(crate) ao_raw: wgpu::TextureView,
+    pub(crate) ao_blur: wgpu::TextureView,
+    pub(crate) ao_sampler: wgpu::Sampler,
+    pub(crate) ao_layout: wgpu::BindGroupLayout,
+    pub(crate) ao_blur_layout: wgpu::BindGroupLayout,
+    pub(crate) ao_pipeline: wgpu::RenderPipeline,
+    pub(crate) ao_blur_pipeline: wgpu::RenderPipeline,
+    pub(crate) ao_bind: Option<wgpu::BindGroup>,
+    pub(crate) ao_blur_bind: Option<wgpu::BindGroup>,
+    pub(crate) ao_valid: bool,
     pub(crate) pipeline: wgpu::RenderPipeline,
     pub(crate) direct: wgpu::RenderPipeline,
     pub(crate) depth_pipeline: wgpu::RenderPipeline,
@@ -220,6 +256,7 @@ pub(crate) struct DrawResources {
     pub(crate) uploaded: Vec<u8>,
     pub(crate) upload_bytes: usize,
     pub(crate) instances_dirty: bool,
+    pub(crate) batch_versions: Vec<Option<u64>>,
     pub(crate) layout_changed: bool,
     pub(crate) shadow_reuse: bool,
     pub(crate) shadow_valid: bool,
@@ -243,6 +280,7 @@ pub struct Renderer {
     clusters: ClusterData,
     light_path: LightPath,
     shadows: bool,
+    ambient_occlusion: bool,
     target: (u32, u32),
     scene: Option<wgpu::TextureView>,
     upscaler: Upscaler,
@@ -469,7 +507,6 @@ impl Renderer {
             .ok_or(RenderError::SurfaceUnsupported)?;
         surface.configure(&device, &config);
 
-        let target = (config.width, config.height);
         let upscaler = Upscaler::new(&device, config.format);
         let depth = create_depth(&device, config.width, config.height);
         let (draws, shader) =
@@ -495,7 +532,8 @@ impl Renderer {
             clusters: ClusterData::default(),
             light_path: LightPath::Auto,
             shadows: true,
-            target,
+            ambient_occlusion: true,
+            target: (0, 0),
             scene: None,
             upscaler,
             dynres: None,
@@ -534,6 +572,10 @@ impl Renderer {
         }
         self.target = size;
         self.depth = create_depth(&self.device, size.0, size.1);
+        let ao_dims = ao_size(size);
+        self.draws.ao_raw = create_ao_texture(&self.device, ao_dims.0, ao_dims.1);
+        self.draws.ao_blur = create_ao_texture(&self.device, ao_dims.0, ao_dims.1);
+        self.draws.ao_valid = false;
         self.draws.hzb = create_hzb(
             &self.device,
             size.0,
@@ -611,6 +653,48 @@ impl Renderer {
         };
         staging.unmap();
         counts
+    }
+
+    fn rebuild_ao_binds(&mut self) {
+        self.draws.ao_bind = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ao"),
+            layout: &self.draws.ao_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.draws.uniform.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&self.depth),
+                },
+            ],
+        }));
+        self.draws.ao_blur_bind = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ao blur"),
+            layout: &self.draws.ao_blur_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&self.draws.ao_raw),
+            }],
+        }));
+        self.draws.bind_group = make_bind_group(
+            &self.device,
+            &self.draws.bind_layout,
+            &self.draws.uniform,
+            &self.draws.lights_store,
+            &self.draws.indices,
+            &self.draws.ranges,
+            &self.draws.shadow_view,
+            &self.draws.shadow_sampler,
+            &self.draws.ao_blur,
+            &self.draws.ao_sampler,
+        );
+        self.draws.ao_valid = true;
+    }
+
+    pub fn set_ambient_occlusion(&mut self, enabled: bool) {
+        self.ambient_occlusion = enabled;
     }
 
     pub fn set_shadows(&mut self, enabled: bool) {
@@ -740,6 +824,10 @@ impl Renderer {
             }
         }
         self.ensure_targets();
+        if !self.draws.ao_valid {
+            self.rebuild_ao_binds();
+        }
+        self.draws.ambient_occlusion_enabled = self.ambient_occlusion;
         let scale_now = self.scale;
         let submitted: usize = batches.iter().map(|batch| batch.instances.len()).sum();
         let total_lights = lights.len().min(MAX_LIGHTS + MAX_DIRECTIONAL);
@@ -840,6 +928,26 @@ impl Renderer {
                 push_floats(&mut self.scratch, &[0.0; 16]);
             }
         }
+        let projection = camera.projection(aspect);
+        push_floats(&mut self.scratch, &projection.inverse().to_cols_array());
+        push_floats(&mut self.scratch, &projection.to_cols_array());
+        push_floats(
+            &mut self.scratch,
+            &[
+                AO_RADIUS,
+                AO_BIAS,
+                AO_STRENGTH,
+                if self.ambient_occlusion { 1.0 } else { 0.0 },
+            ],
+        );
+        push_floats(
+            &mut self.scratch,
+            &[SKY_COLOR[0], SKY_COLOR[1], SKY_COLOR[2], 0.0],
+        );
+        push_floats(
+            &mut self.scratch,
+            &[GROUND_COLOR[0], GROUND_COLOR[1], GROUND_COLOR[2], 0.0],
+        );
         self.queue
             .write_buffer(&self.draws.uniform, 0, &self.scratch);
         self.upload_lights();
@@ -996,6 +1104,8 @@ impl Renderer {
                 &self.draws.ranges,
                 &self.draws.shadow_view,
                 &self.draws.shadow_sampler,
+                &self.draws.ao_blur,
+                &self.draws.ao_sampler,
             );
         }
         self.scratch.clear();
@@ -1024,14 +1134,10 @@ impl Renderer {
         shadow_candidate: bool,
     ) {
         let total: usize = batches.iter().map(|batch| batch.instances.len()).sum();
-        self.scratch.clear();
         let previous_batches = std::mem::take(&mut self.draws.batches);
         self.draws.groups.clear();
         let mut first = 0usize;
         for batch in batches {
-            for instance in batch.instances {
-                push_instance(&mut self.scratch, instance);
-            }
             let count = u32::try_from(batch.instances.len()).unwrap_or(u32::MAX);
             self.draws.batches.push(BatchDraw {
                 mesh: batch.mesh.0,
@@ -1057,12 +1163,31 @@ impl Renderer {
             self.draws.binds_valid = false;
             self.draws.uploaded.clear();
         }
-        let (upload_bytes, instances_dirty) = sync_instances(
-            &self.queue,
-            &self.draws.raw_instances,
-            &mut self.draws.uploaded,
-            &self.scratch,
+        let unchanged_versions = versions_unchanged(
+            batches.iter().map(|batch| batch.version),
+            &self.draws.batch_versions,
         );
+        self.draws.batch_versions.clear();
+        self.draws
+            .batch_versions
+            .extend(batches.iter().map(|batch| batch.version));
+        let static_scene = unchanged_versions && !self.draws.layout_changed && !reallocated;
+        let (upload_bytes, instances_dirty) = if static_scene {
+            (0, false)
+        } else {
+            self.scratch.clear();
+            for batch in batches {
+                for instance in batch.instances {
+                    push_instance(&mut self.scratch, instance);
+                }
+            }
+            sync_instances(
+                &self.queue,
+                &self.draws.raw_instances,
+                &mut self.draws.uploaded,
+                &self.scratch,
+            )
+        };
         self.draws.upload_bytes = upload_bytes;
         self.draws.instances_dirty = instances_dirty;
         let reuse =
@@ -1083,12 +1208,14 @@ impl Renderer {
             self.queue.write_buffer(
                 &slot.params[0],
                 0,
-                &cull_params_bytes(camera, first, count, lod_count, phase1, capacity, radius),
+                &cull_params_bytes(
+                    camera, first, count, lod_count, phase1, capacity, radius, 0.0,
+                ),
             );
             self.queue.write_buffer(
                 &slot.params[1],
                 0,
-                &cull_params_bytes(camera, first, count, lod_count, 2, capacity, radius),
+                &cull_params_bytes(camera, first, count, lod_count, 2, capacity, radius, 0.0),
             );
             self.queue.write_buffer(
                 &slot.params[2],
@@ -1101,6 +1228,7 @@ impl Renderer {
                     3,
                     capacity,
                     radius,
+                    shadow_pixels_per_unit(),
                 ),
             );
             let written = if reuse { 2 } else { 3 };
@@ -1225,6 +1353,54 @@ fn sync_instances(
     (written, written > 0)
 }
 
+pub(crate) fn versions_unchanged(
+    versions: impl ExactSizeIterator<Item = Option<u64>>,
+    previous: &[Option<u64>],
+) -> bool {
+    versions.len() == previous.len()
+        && versions
+            .zip(previous)
+            .all(|(version, last)| version.is_some() && version == *last)
+}
+
+#[cfg(test)]
+mod versioned_upload_tests {
+    use super::versions_unchanged;
+
+    #[test]
+    fn a_versioned_scene_is_unchanged_only_when_every_version_matches() {
+        assert!(versions_unchanged(
+            [Some(1), Some(2)].into_iter(),
+            &[Some(1), Some(2)]
+        ));
+        assert!(!versions_unchanged(
+            [Some(1), Some(3)].into_iter(),
+            &[Some(1), Some(2)]
+        ));
+    }
+
+    #[test]
+    fn an_unversioned_batch_is_never_treated_as_unchanged() {
+        assert!(!versions_unchanged([None].into_iter(), &[None]));
+        assert!(!versions_unchanged(
+            [Some(1), None].into_iter(),
+            &[Some(1), None]
+        ));
+    }
+
+    #[test]
+    fn a_change_in_the_number_of_batches_is_a_change() {
+        assert!(!versions_unchanged([Some(1)].into_iter(), &[]));
+        assert!(!versions_unchanged([].into_iter(), &[Some(1)]));
+        assert!(versions_unchanged([].into_iter(), &[]));
+    }
+}
+
+fn shadow_pixels_per_unit() -> f32 {
+    SHADOW_SIZE as f32 * 0.5 / SHADOW_HALF_EXTENT
+}
+
+#[allow(clippy::too_many_arguments)]
 fn cull_params_bytes(
     planes: [[f32; 4]; 6],
     first: u32,
@@ -1233,6 +1409,7 @@ fn cull_params_bytes(
     phase: u32,
     capacity: u32,
     radius: f32,
+    shadow_scale: f32,
 ) -> Vec<u8> {
     let mut out = Vec::with_capacity(CULL_PARAM_BYTES as usize);
     for plane in planes {
@@ -1242,7 +1419,8 @@ fn cull_params_bytes(
         out.extend_from_slice(&value.to_le_bytes());
     }
     out.extend_from_slice(&radius.to_le_bytes());
-    out.extend_from_slice(&[0u8; 8]);
+    out.extend_from_slice(&[0u8; 4]);
+    out.extend_from_slice(&shadow_scale.to_le_bytes());
     out
 }
 
@@ -1674,6 +1852,22 @@ impl DrawResources {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
             ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1732,6 +1926,62 @@ impl DrawResources {
                 view_formats: &[],
             })
             .create_view(&wgpu::TextureViewDescriptor::default());
+        let ao_placeholder = create_ao_texture(device, 1, 1);
+        let ao_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("ao"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            lod_min_clamp: 0.0,
+            lod_max_clamp: 0.0,
+            compare: None,
+            anisotropy_clamp: 1,
+            border_color: None,
+        });
+        let ao_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("ao"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let ao_blur_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("ao blur"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            }],
+        });
+        let ao_pipeline = build_fullscreen_pipeline(device, &ao_layout, AO_SOURCE, "ao");
+        let ao_blur_pipeline =
+            build_fullscreen_pipeline(device, &ao_blur_layout, BLUR_SOURCE, "ao blur");
         let shadow_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("shadow compare"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -1755,6 +2005,8 @@ impl DrawResources {
             &ranges,
             &shadow_view,
             &shadow_sampler,
+            &ao_placeholder,
+            &ao_sampler,
         );
 
         let shadow_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1869,6 +2121,17 @@ impl DrawResources {
             shadow_view,
             shadow_sampler,
             shadows_enabled: false,
+            ambient_occlusion_enabled: true,
+            ao_raw: ao_placeholder.clone(),
+            ao_blur: ao_placeholder.clone(),
+            ao_sampler,
+            ao_layout,
+            ao_blur_layout,
+            ao_pipeline,
+            ao_blur_pipeline,
+            ao_bind: None,
+            ao_blur_bind: None,
+            ao_valid: false,
             pipeline,
             direct,
             depth_pipeline,
@@ -1906,6 +2169,7 @@ impl DrawResources {
             uploaded: Vec::new(),
             upload_bytes: 0,
             instances_dirty: false,
+            batch_versions: Vec::new(),
             layout_changed: true,
             shadow_reuse: false,
             shadow_valid: false,
@@ -1934,6 +2198,8 @@ fn make_bind_group(
     ranges: &wgpu::Buffer,
     shadow_view: &wgpu::TextureView,
     shadow_sampler: &wgpu::Sampler,
+    ao_view: &wgpu::TextureView,
+    ao_sampler: &wgpu::Sampler,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("frame"),
@@ -1962,6 +2228,14 @@ fn make_bind_group(
             wgpu::BindGroupEntry {
                 binding: 5,
                 resource: wgpu::BindingResource::Sampler(shadow_sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 6,
+                resource: wgpu::BindingResource::TextureView(ao_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 7,
+                resource: wgpu::BindingResource::Sampler(ao_sampler),
             },
         ],
     })
@@ -2176,6 +2450,77 @@ fn create_args(device: &wgpu::Device) -> wgpu::Buffer {
     })
 }
 
+fn ao_size(target: (u32, u32)) -> (u32, u32) {
+    ((target.0 / 2).max(1), (target.1 / 2).max(1))
+}
+
+fn create_ao_texture(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {
+    device
+        .create_texture(&wgpu::TextureDescriptor {
+            label: Some("ambient occlusion"),
+            size: wgpu::Extent3d {
+                width: width.max(1),
+                height: height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        })
+        .create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+fn build_fullscreen_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    source: &str,
+    label: &str,
+) -> wgpu::RenderPipeline {
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some(label),
+        source: wgpu::ShaderSource::Wgsl(source.into()),
+    });
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some(label),
+        bind_group_layouts: &[Some(layout)],
+        immediate_size: 0,
+    });
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(label),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &module,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &module,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: wgpu::TextureFormat::R8Unorm,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+const AO_SOURCE: &str = concat!(
+    include_str!("../shaders/frame.wgsl"),
+    include_str!("../shaders/ao.wgsl")
+);
+const BLUR_SOURCE: &str = include_str!("../shaders/blur.wgsl");
+
 fn create_depth(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("depth"),
@@ -2292,7 +2637,7 @@ mod tests {
     fn the_frame_uniform_holds_the_matrix_header_and_every_light_slot() {
         assert_eq!(
             FRAME_BYTES,
-            (16 + 16 + 4 + 4 + 4 + 16 + 4 + MAX_DIRECTIONAL as u64 * 16) * 4
+            (16 + 16 + 4 + 4 + 4 + 16 + 4 + MAX_DIRECTIONAL as u64 * 16 + 16 + 16 + 4 + 4 + 4) * 4
         );
     }
 
@@ -2322,7 +2667,7 @@ mod tests {
         push_instance(&mut bytes, &instance);
         assert_eq!(bytes.len() as u64, INSTANCE_BYTES);
         assert_eq!(
-            cull_params_bytes([[0.0; 4]; 6], 0, 0, 1, 0, 1, 1.0).len() as u64,
+            cull_params_bytes([[0.0; 4]; 6], 0, 0, 1, 0, 1, 1.0, 0.0).len() as u64,
             CULL_PARAM_BYTES
         );
         assert_eq!(
@@ -2459,7 +2804,19 @@ mod shadow_tests {
     fn the_frame_uniform_matches_the_shader_layout() {
         assert_eq!(
             FRAME_BYTES,
-            (16 + 16 + 4 + 4 + 4 + 16 + 4 + MAX_DIRECTIONAL as u64 * 16) * 4
+            (16 + 16 + 4 + 4 + 4 + 16 + 4 + MAX_DIRECTIONAL as u64 * 16 + 16 + 16 + 4 + 4 + 4) * 4
         );
+    }
+}
+
+#[cfg(test)]
+mod hd_shader_tests {
+    use super::*;
+
+    #[test]
+    fn the_lit_and_ao_shaders_declare_the_same_frame_layout() {
+        let frame = include_str!("../shaders/frame.wgsl");
+        assert!(include_str!("../shaders/cube.wgsl").contains(frame));
+        assert!(AO_SOURCE.contains(frame));
     }
 }

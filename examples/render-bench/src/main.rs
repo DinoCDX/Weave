@@ -229,8 +229,8 @@ impl App {
                     broken_kept_drawing: false,
                     restored: None,
                     edited_text: EMBEDDED.replace(
-                        "return vec4<f32>(color, input.color.a);",
-                        "return vec4<f32>(color.b, color.g, color.r, input.color.a);",
+                        "return vec4<f32>(aces(color), input.color.a);",
+                        "return vec4<f32>(aces(color.bgr), input.color.a);",
                     ),
                 })
             }
@@ -328,10 +328,7 @@ fn dense_step(dense: &mut Dense, renderer: &mut Renderer) -> bool {
             &camera,
             &dense.lights,
             &params,
-            &[Batch {
-                mesh: CUBE,
-                instances: &dense.instances,
-            }],
+            &[Batch::versioned(CUBE, &dense.instances, 1)],
         )
         .unwrap_or_else(|error| panic!("{error}"));
     if dense.options.sync {
@@ -392,15 +389,7 @@ fn reload_step(reload: &mut Reload, renderer: &mut Renderer) -> bool {
     }
 
     let instances = [DrawInstance::new(Mat4::IDENTITY, [1.0, 0.5, 0.2, 1.0])];
-    let drew = renderer.draw(
-        &camera,
-        &lights,
-        &params,
-        &[Batch {
-            mesh: CUBE,
-            instances: &instances,
-        }],
-    );
+    let drew = renderer.draw(&camera, &lights, &params, &[Batch::new(CUBE, &instances)]);
     if (120..180).contains(&frame) && drew.is_ok() {
         reload.broken_kept_drawing =
             renderer.visible_counts().first() == Some(&1) && renderer.shader_error().is_some();

@@ -17,7 +17,7 @@ struct Params {
     capacity: u32,
     radius: f32,
     pad0: u32,
-    pad1: u32,
+    shadow_scale: f32,
 }
 
 struct Camera {
@@ -48,6 +48,21 @@ fn inside_frustum(center: vec3<f32>, reach: f32) -> bool {
 fn screen_radius(view_center: vec3<f32>, radius: f32) -> f32 {
     let dist = max(-view_center.z, 0.0001);
     return radius * camera.proj[1][1] / dist * 0.5 * camera.screen.y;
+}
+
+fn select_shadow_lod(reach: f32) -> u32 {
+    let r_px = reach * params.shadow_scale;
+    var lod = 0u;
+    if (r_px < 2.0 * camera.lods.x) {
+        lod = 1u;
+    }
+    if (r_px < 2.0 * camera.lods.y) {
+        lod = 2u;
+    }
+    if (r_px < 2.0 * camera.lods.z) {
+        lod = 3u;
+    }
+    return min(lod, params.lod_count - 1u);
 }
 
 fn select_lod(r_px: f32) -> u32 {
@@ -128,7 +143,7 @@ fn cull_main(@builtin(global_invocation_id) id: vec3<u32>) {
         }
         return;
     }
-    let lod = select(select_lod(screen_radius(view_center, reach)), 0u, params.phase == 3u);
+    let lod = select(select_lod(screen_radius(view_center, reach)), select_shadow_lod(reach), params.phase == 3u);
     let slot = atomicAdd(&args[lod * 5u + 1u], 1u);
     out[lod * params.capacity + params.first + slot] = instance;
     if (params.phase == 1u) {

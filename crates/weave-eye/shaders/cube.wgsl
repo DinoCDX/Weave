@@ -14,6 +14,11 @@ struct Frame {
     shadow_view_proj: mat4x4<f32>,
     shadow_params: vec4<f32>,
     directional: array<Light, 4>,
+    inv_proj: mat4x4<f32>,
+    proj: mat4x4<f32>,
+    hd: vec4<f32>,
+    sky: vec4<f32>,
+    ground: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> frame: Frame;
@@ -22,6 +27,8 @@ struct Frame {
 @group(0) @binding(3) var<storage, read> cluster_ranges: array<vec2<u32>>;
 @group(0) @binding(4) var shadow_map: texture_depth_2d;
 @group(0) @binding(5) var shadow_sampler: sampler_comparison;
+@group(0) @binding(6) var ao_map: texture_2d<f32>;
+@group(0) @binding(7) var ao_sampler: sampler;
 
 struct VertexIn {
     @location(0) position: vec3<f32>,
@@ -158,10 +165,10 @@ fn shadow_factor(world: vec3<f32>, n: vec3<f32>) -> f32 {
     let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
     let depth = ndc.z - frame.shadow_params.x;
     let inside = uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0 && depth <= 1.0;
-    let a = textureSampleCompare(shadow_map, shadow_sampler, uv + vec2<f32>(-0.5, -0.5) * texel, depth);
-    let b = textureSampleCompare(shadow_map, shadow_sampler, uv + vec2<f32>(0.5, -0.5) * texel, depth);
-    let c = textureSampleCompare(shadow_map, shadow_sampler, uv + vec2<f32>(-0.5, 0.5) * texel, depth);
-    let d = textureSampleCompare(shadow_map, shadow_sampler, uv + vec2<f32>(0.5, 0.5) * texel, depth);
+    let a = textureSampleCompareLevel(shadow_map, shadow_sampler, uv + vec2<f32>(-0.5, -0.5) * texel, depth);
+    let b = textureSampleCompareLevel(shadow_map, shadow_sampler, uv + vec2<f32>(0.5, -0.5) * texel, depth);
+    let c = textureSampleCompareLevel(shadow_map, shadow_sampler, uv + vec2<f32>(-0.5, 0.5) * texel, depth);
+    let d = textureSampleCompareLevel(shadow_map, shadow_sampler, uv + vec2<f32>(0.5, 0.5) * texel, depth);
     let pcf = (a + b + c + d) * 0.25;
     return select(1.0, pcf, inside);
 }
@@ -181,7 +188,10 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     );
     var direct = vec3<f32>(0.0);
     let directional_count = u32(frame.viewport.z);
-    let visibility = shadow_factor(input.world, n);
+    var visibility = 1.0;
+    if (directional_count > 0u && dot(n, -normalize(frame.directional[0].direction.xyz)) > 0.0) {
+        visibility = shadow_factor(input.world, n);
+    }
     for (var i = 0u; i < directional_count; i++) {
         var contribution = shade(frame.directional[i], surf);
         if (i == 0u) {
@@ -195,7 +205,10 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
         let light = lights[light_indices[range.x + k]];
         direct = direct + shade(light, surf);
     }
-    let ambient = frame.params.y * input.color.rgb * (1.0 - input.material.x);
+    let up = dot(n, vec3<f32>(0.0, 1.0, 0.0)) * 0.5 + 0.5;
+    let hemisphere = mix(frame.ground.rgb, frame.sky.rgb, up);
+    let occlusion = textureSampleLevel(ao_map, ao_sampler, input.clip.xy / frame.viewport.xy, 0.0).r;
+    let ambient = frame.params.y * hemisphere * input.color.rgb * (1.0 - input.material.x) * occlusion;
     let color = (direct + ambient) * frame.params.x;
     return vec4<f32>(aces(color), input.color.a);
 }

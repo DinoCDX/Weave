@@ -15,7 +15,7 @@ pub struct Mesh {
 }
 
 impl Mesh {
-    fn finish(vertices: Vec<Vertex>, indices: Vec<u32>) -> Self {
+    pub(crate) fn finish(vertices: Vec<Vertex>, indices: Vec<u32>) -> Self {
         let bounding_radius = vertices
             .iter()
             .map(|v| Vec3::from_array(v.position).length())

@@ -21,6 +21,8 @@ struct Options {
     shadows: bool,
     occlusion: bool,
     still: bool,
+    model: Option<String>,
+    ao: bool,
 }
 
 fn parse_options() -> Options {
@@ -33,6 +35,8 @@ fn parse_options() -> Options {
         shadows: true,
         occlusion: true,
         still: false,
+        model: None,
+        ao: true,
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -47,6 +51,8 @@ fn parse_options() -> Options {
             }
             "--frames" => options.frames = args[i + 1].parse().ok(),
             "--extra-lights" => options.extra_lights = args[i + 1].parse().unwrap_or(0),
+            "--ao" => options.ao = args[i + 1] != "off",
+            "--model" => options.model = Some(args[i + 1].clone()),
             "--shadows" => options.shadows = args[i + 1] != "off",
             "--occlusion" => options.occlusion = args[i + 1] != "off",
             "--still" => options.still = args[i + 1] == "on",
@@ -164,18 +170,9 @@ impl App {
         .with_material(0.9, 0.22)];
         scene.ground_instances[0] = DrawInstance::new(Mat4::IDENTITY, [0.36, 0.37, 0.42, 1.0]);
         let batches = [
-            Batch {
-                mesh: scene.ground,
-                instances: &scene.ground_instances,
-            },
-            Batch {
-                mesh: scene.sphere,
-                instances: &sphere,
-            },
-            Batch {
-                mesh: CUBE,
-                instances: &scene.cubes,
-            },
+            Batch::new(scene.ground, &scene.ground_instances),
+            Batch::new(scene.sphere, &sphere),
+            Batch::new(CUBE, &scene.cubes),
         ];
         match renderer.draw(&self.camera, &self.lights, &self.params, &batches) {
             Ok(stats) => self.stats_last = Some(stats),
@@ -208,13 +205,23 @@ impl ApplicationHandler for App {
         renderer.set_culling(true);
         renderer.set_light_path(self.options.path);
         renderer.set_shadows(self.options.shadows);
+        renderer.set_ambient_occlusion(self.options.ao);
         renderer.set_occlusion_culling(self.options.occlusion);
-        let sphere = renderer.add_mesh_lods(&[
-            lobed_sphere(256, 128),
-            lobed_sphere(128, 64),
-            lobed_sphere(48, 24),
-            lobed_sphere(16, 8),
-        ]);
+        let sphere = match &self.options.model {
+            Some(path) => {
+                let text = std::fs::read_to_string(path)
+                    .unwrap_or_else(|error| panic!("could not read {path}: {error}"));
+                let mesh =
+                    weave_eye::parse_obj(&text).unwrap_or_else(|error| panic!("{path}: {error}"));
+                renderer.add_mesh_lods(&[mesh.fitted(1.6)])
+            }
+            None => renderer.add_mesh_lods(&[
+                lobed_sphere(256, 128),
+                lobed_sphere(128, 64),
+                lobed_sphere(48, 24),
+                lobed_sphere(16, 8),
+            ]),
+        };
         let ground = renderer.add_mesh(&ground(30.0, -1.4));
         let cubes = (0..6)
             .map(|i| {

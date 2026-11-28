@@ -470,3 +470,80 @@ What it does not show:
 - Why the GPU-timestamp controller drops to the minimum at a 150 ms budget, while the interval controller held about 113 ms in B-020. The pass sum at the minimum scale stays above the 85 percent raise threshold, so the controller correctly keeps the scale low. The difference from B-020 comes mostly from the sharpen cost, which the interval controller saw too but which was smaller in that run. This was not separated further.
 - The cull compute pass is not timed (it has no timestamp writes), so its cost is excluded from the controller input.
 - CPU-side cost. The controller watches GPU time only, so a CPU-bound frame does not lower the scale.
+
+## B-022: static-scene upload, shadow LOD from the light, and shadow gating (lavapipe, this session)
+
+Session: 1 vCPU, Mesa lavapipe under Xvfb, rustc and cargo 1.89.0, release builds from the uploaded tree plus the changes in D-R16 to D-R18. Single runs unless stated, so variation is about ±10 percent (see B-004 for the run-to-run spread on this host).
+
+Dense scene, the static case, same command before and after the upload change:
+`render-bench --scenario dense --count 10000 --cull on --sync on --frames 200`, 800x600.
+
+| build | frame (µs) | CPU batch setup and upload per frame (µs) | upload per frame |
+|---|---:|---:|---:|
+| before the change | 51,711 | 649 | 0 B |
+| after the change | 53,229 | 19 | 0 B |
+
+The frame times are within noise of each other; GPU opaque time did not change. The CPU saving is real and removes about 0.6 ms of per-frame work on the CPU, which matters once the scene is larger or the CPU is busy. Note that the value labelled `cull` in the output is now the per-frame CPU time for batch setup and upload; the CPU culling it used to include is gone from the frame path.
+
+Dense scene, per-pass GPU time, after the change, 120 frames: depth prepass 10,385 µs, opaque 28,756 µs, clear 867 µs, shadow pass 324 µs (cache reused 90 of 90 frames). The shadow cache is what keeps the shadow pass at a few hundred microseconds here.
+
+Showcase, shadows on, 800x600, 120 frames, shadow pass GPU time (the sphere rotates, so the cache does not hit):
+
+| build | shadow pass (µs) | opaque (µs) |
+|---|---:|---:|
+| before the shadow LOD change | 20,793 | about 22,000 |
+| after, first run | 8,680 | 22,052 |
+| after, second run | 9,878 | 24,403 |
+
+The shadow LOD change (D-R17) picks the caster's LOD from its size in shadow-map pixels, with thresholds twice the camera's. The shadow pass draws about one quarter of the triangles for the sphere. The captured frame shows no visible faceting at the shadow edges.
+
+Shadow lookup gating (D-R18), dense scene, 120 frames: opaque 29,192 µs before and 28,756 µs after. That is within noise, so this change is not claimed as a measured speed-up. It removes work for surfaces facing away from the key light on real hardware, where texture fetches are the cost.
+
+Regression checks:
+- Reload scenario (the shader changed): edit applied in 13.4 ms, broken edit rejected, restore from cache. The first run after the shader change failed for a reason in the benchmark, not the renderer: its edit targeted a return line that no longer existed, so the test "edit" was the original text. The harness now asserts that its edit changes the shader.
+- Showcase image, shadows on, after the gating change: shadows match the earlier capture (sphere, cubes, and the floor shadows are in the same places).
+- CPU heart benchmark (`heart-bench`): within the range recorded in B-001 and B-004. The heart code did not change.
+
+What it does not show:
+- Anything about a real GPU. Lavapipe executes the fragment and vertex work on the CPU, so the per-pixel shading (about 29 ms for 5,068 cubes) is the dominant cost here and is not representative.
+- The shadows-off comparison that B-017 reports. `render-bench` has no shadows switch, so that row was not re-run in this session.
+
+Compared with: B-017 (the same scene and flags, earlier host state), B-018 (occlusion), and B-019 (the upload path that this change refines).
+
+## B-023: real GPU, reported by the project owner (not measured in this environment)
+
+Machine: a laptop with an NVIDIA GeForce GTX 1050, driving a 60 Hz display. Reported result: the showcase runs at 60 frames per second.
+
+What it shows: the current renderer meets its 60 fps target on real hardware. The lavapipe entries above (B-004 to B-022) run the GPU work on the CPU, so they overstate the cost of every pass. Real-GPU numbers will be lower than those tables.
+
+What it does not show: headroom. A 60 Hz display caps the frame rate at 60, so a frame that takes 4 ms looks the same as one that takes 15 ms. Headroom needs the frame time with the cap removed.
+
+Commands to measure headroom on the same laptop (send the output of each):
+
+```
+target\release\render-bench --scenario dense --count 10000 --cull on --sync on --frames 300
+target\release\showcase --size 1920x1080 --frames 300
+target\release\showcase --size 1920x1080 --frames 300 --extra-lights 512 --extra-range 1.2
+```
+
+Add the output of the pass report (printed at the end of the showcase run) to the entry, and record the GPU name, driver version, and the display's refresh rate.
+
+## B-024: HD lighting, ambient occlusion cost, armadillo scene (lavapipe, this session)
+
+Scene: `showcase --size 1920x1080 --frames 40 --model assets/external/armadillo.obj`, release build, Mesa lavapipe under Xvfb, 1 vCPU. The armadillo is the Stanford model from docs/models.md, fitted to radius 1.6, 100,000 triangles.
+
+| pass | GPU average, AO on (µs) | GPU average, AO off (µs) |
+|---|---:|---:|
+| ao (half resolution, 12 samples) | 50,764 | 128 |
+| ao_blur (4x4 box) | 16,836 | 120 |
+| ao (half resolution, 8 samples) | 29,062 | 128 |
+| ao_blur (3x3 box) | 10,798 | 120 |
+| opaque, 8 samples | 146,825 | 148,373 |
+
+What it shows: the eight-sample, three-by-three version cuts the AO cost from about 67 ms to about 40 ms per frame on this software driver, and the image stays clean. The opaque pass is unchanged, since it does the armadillo's shading rather than the occlusion.
+
+Changing the per-sample depth reconstruction to a direct depth-to-view conversion (shader change in ao.wgsl) did not change the AO cost (50,764 µs before and after with twelve samples). The cost is the number of samples per pixel, not the reconstruction, so the reconstruction change is kept for clarity but is not claimed as a speed-up.
+
+Quality: the occlusion darkens the gaps between the legs and under the belly and is subtle at this scale. The contact under the feet is hard to see at 1280x720. Stronger settings (radius 0.9, strength 2.2) were checked against the default and were judged modest, so the default is kept.
+
+What it does not show: real-GPU costs. On a GPU, these passes are much cheaper than on this driver, and the GTX 1050 result in B-023 is the reference for real hardware.

@@ -252,7 +252,9 @@ impl Pass for OpaquePass {
     }
 
     fn reads(&self) -> &'static [&'static str] {
-        &["color", "depth", "depth2", "shadow", "cull", "cull2"]
+        &[
+            "color", "depth", "depth2", "shadow", "cull", "cull2", "ao_blur",
+        ]
     }
 
     fn writes(&self) -> &'static [&'static str] {
@@ -631,6 +633,98 @@ fn draw_indirect(
     }
 }
 
+pub(crate) struct AoPass;
+
+impl Pass for AoPass {
+    fn name(&self) -> &'static str {
+        "ao"
+    }
+
+    fn reads(&self) -> &'static [&'static str] {
+        &["depth"]
+    }
+
+    fn writes(&self) -> &'static [&'static str] {
+        &["ao"]
+    }
+
+    fn record(&mut self, cx: &mut PassContext<'_>) {
+        let draws = cx.draws;
+        let timestamp_writes = cx.timestamp_writes();
+        let mut pass = cx.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("ao"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &draws.ao_raw,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::WHITE),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        let Some(bind) = draws.ao_bind.as_ref() else {
+            return;
+        };
+        if !draws.ambient_occlusion_enabled {
+            return;
+        }
+        pass.set_pipeline(&draws.ao_pipeline);
+        pass.set_bind_group(0, bind, &[]);
+        pass.draw(0..3, 0..1);
+    }
+}
+
+pub(crate) struct AoBlurPass;
+
+impl Pass for AoBlurPass {
+    fn name(&self) -> &'static str {
+        "ao_blur"
+    }
+
+    fn reads(&self) -> &'static [&'static str] {
+        &["ao"]
+    }
+
+    fn writes(&self) -> &'static [&'static str] {
+        &["ao_blur"]
+    }
+
+    fn record(&mut self, cx: &mut PassContext<'_>) {
+        let draws = cx.draws;
+        let timestamp_writes = cx.timestamp_writes();
+        let mut pass = cx.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("ao blur"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &draws.ao_blur,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::WHITE),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        let Some(bind) = draws.ao_blur_bind.as_ref() else {
+            return;
+        };
+        if !draws.ambient_occlusion_enabled {
+            return;
+        }
+        pass.set_pipeline(&draws.ao_blur_pipeline);
+        pass.set_bind_group(0, bind, &[]);
+        pass.draw(0..3, 0..1);
+    }
+}
+
 pub(crate) fn default_passes() -> Vec<Box<dyn Pass>> {
     vec![
         Box::new(CullPass),
@@ -640,6 +734,8 @@ pub(crate) fn default_passes() -> Vec<Box<dyn Pass>> {
         Box::new(HzbPass),
         Box::new(CullPhase2Pass),
         Box::new(DepthPass2),
+        Box::new(AoPass),
+        Box::new(AoBlurPass),
         Box::new(OpaquePass),
         Box::new(TransparentPass),
         Box::new(PostPass),
@@ -734,6 +830,8 @@ mod tests {
                 "hzb",
                 "cull2",
                 "depth2",
+                "ao",
+                "ao_blur",
                 "opaque",
                 "transparent",
                 "post"
@@ -747,6 +845,8 @@ mod tests {
             "depth",
             "hzb",
             "cull2",
+            "ao",
+            "ao_blur",
             "depth2",
             "opaque",
             "transparent",
